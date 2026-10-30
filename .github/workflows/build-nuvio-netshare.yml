@@ -17,11 +17,13 @@ jobs:
       - name: Pin source tree to the commit the patch targets
         run: |
           mkdir -p /tmp/bundle
-          mv nuvio-netshare-support.patch /tmp/bundle/
+          mv nuvio-netshare-support.patch runtime-local.properties /tmp/bundle/
           git fetch --depth=1 origin 10feb659ae3368008a584316bd5e1d2665e3aa6c
           git checkout -f --detach FETCH_HEAD
-          mv /tmp/bundle/nuvio-netshare-support.patch .
-          test -f nuvio-netshare-support.patch || { echo "MISSING BUNDLE FILE"; exit 1; }
+          mv /tmp/bundle/nuvio-netshare-support.patch /tmp/bundle/runtime-local.properties .
+          for f in nuvio-netshare-support.patch runtime-local.properties; do
+            test -f "$f" || { echo "MISSING BUNDLE FILE: $f"; exit 1; }
+          done
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -35,8 +37,8 @@ jobs:
       - name: Apply NetShare patch
         run: git apply nuvio-netshare-support.patch
 
-      - name: Prepare runtime properties
-        run: touch local.properties
+      - name: Prepare runtime properties (publishable client config)
+        run: cp runtime-local.properties local.properties
 
       - name: Build fullDebug APK
         run: ./gradlew :androidApp:assembleFullDebug -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore --stacktrace
