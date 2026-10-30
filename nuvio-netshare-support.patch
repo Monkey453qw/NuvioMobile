@@ -1,0 +1,329 @@
+diff --git a/composeApp/build.gradle.kts b/composeApp/build.gradle.kts
+index 69d1e2ff..28feb761 100644
+--- a/composeApp/build.gradle.kts
++++ b/composeApp/build.gradle.kts
+@@ -447,6 +447,9 @@ kotlin {
+                 implementation(libs.coil.gif)
+                 implementation("androidx.recyclerview:recyclerview:1.4.0")
+                 implementation("com.squareup.okhttp3:okhttp:4.12.0")
++                // DoH fallback for ResilientDns — direct connections survive
++                // networks with no working local DNS (proxy-only hotspots).
++                implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
+                 implementation("com.google.code.gson:gson:2.11.0")
+                 // libass - atlas-based subtitle rendering (from NuvioMedia/nuvio-libass)
+                 implementation(files("libs/nuvio-libass-release.aar"))
+diff --git a/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt b/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
+index c1b3aa97..d202f84c 100644
+--- a/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
++++ b/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
+@@ -1,7 +1,7 @@
+ package com.nuvio.app.features.trailer
+ 
+ import android.net.Uri
+-import com.nuvio.app.core.network.IPv4FirstDns
++import com.nuvio.app.core.network.ResilientDns
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+@@ -24,7 +24,7 @@ internal object TrailerExtractionPlatform {
+     )
+ 
+     private val httpClient = OkHttpClient.Builder()
+-        .dns(IPv4FirstDns())
++        .dns(ResilientDns())
+         .connectTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+         .readTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+         .writeTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+@@ -33,7 +33,7 @@ internal object TrailerExtractionPlatform {
+         .build()
+ 
+     private val probeClient = OkHttpClient.Builder()
+-        .dns(IPv4FirstDns())
++        .dns(ResilientDns())
+         .connectTimeout(2, TimeUnit.SECONDS)
+         .readTimeout(2, TimeUnit.SECONDS)
+         .followRedirects(true)
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt
+new file mode 100644
+index 00000000..f62e12cc
+--- /dev/null
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt
+@@ -0,0 +1,56 @@
++package com.nuvio.app.core.network
++
++import okhttp3.Dns
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.OkHttpClient
++import okhttp3.dnsoverhttps.DnsOverHttps
++import java.net.InetAddress
++import java.util.concurrent.TimeUnit
++
++/**
++ * IPv4-first DNS with a DNS-over-HTTPS fallback.
++ *
++ * OkHttp only consults [Dns] for DIRECT connections — requests selected for the
++ * system HTTP proxy skip DNS entirely. So on a proxy-only hotspot this class is
++ * normally never hit. When a connection does go direct and the network's local
++ * DNS is dead (NetShare hotspots, where Android Private DNS / DoT:853 cannot
++ * run), the system lookup would previously block for many seconds and fail.
++ * Falling back to DoH resolvers addressed by IP literal keeps those direct
++ * connections working with zero local DNS. On healthy networks nothing changes:
++ * the system lookup succeeds on the first try.
++ */
++class ResilientDns : Dns {
++
++    private val delegate = IPv4FirstDns()
++
++    private val dohFallback: List<Dns> by lazy {
++        val bootstrap = OkHttpClient.Builder()
++            .connectTimeout(4, TimeUnit.SECONDS)
++            .readTimeout(4, TimeUnit.SECONDS)
++            .callTimeout(6, TimeUnit.SECONDS)
++            .build()
++        listOf("1.1.1.1", "8.8.8.8").map { resolverIp ->
++            DnsOverHttps.Builder()
++                .client(bootstrap)
++                // IP-literal URL: no bootstrap DNS needed, and both resolvers ship
++                // TLS certificates valid for their bare IPs.
++                .url("https://$resolverIp/dns-query".toHttpUrl())
++                .build()
++        }
++    }
++
++    override fun lookup(hostname: String): List<InetAddress> {
++        try {
++            return delegate.lookup(hostname)
++        } catch (systemFailure: Exception) {
++            dohFallback.forEach { resolver ->
++                try {
++                    return resolver.lookup(hostname)
++                } catch (_: Exception) {
++                    // try the next resolver
++                }
++            }
++            throw systemFailure
++        }
++    }
++}
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt
+new file mode 100644
+index 00000000..ef1d7102
+--- /dev/null
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt
+@@ -0,0 +1,86 @@
++package com.nuvio.app.core.network
++
++import android.content.Context
++import android.net.ConnectivityManager
++import android.os.Build
++import android.util.Log
++import java.net.URI
++
++/**
++ * Read-only access to the Android system HTTP proxy (the "Manual proxy" set in
++ * the Wi-Fi network options).
++ *
++ * Why this matters: on NetShare-style no-root "proxy hotspots" the Wi-Fi network
++ * exposes a working HTTP CONNECT proxy but has NO working DNS (and Android
++ * Private DNS / DoT:853 cannot run over it either). OkHttp — the whole app API,
++ * images, addons, ExoPlayer playback — automatically honors that proxy and
++ * needs zero local DNS. libmpv does not: it resolves hostnames itself and
++ * opens raw sockets, which blocks forever on such a network. Feeding mpv the
++ * same system proxy through its `http-proxy` property makes playback work
++ * with zero local DNS, exactly like every other request in the app.
++ */
++object SystemProxy {
++
++    private const val TAG = "SystemProxy"
++
++    private val IPV4_REGEX = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""")
++
++    /** host + port of the default network's HTTP proxy, or null when none is set. */
++    fun defaultProxy(context: Context): Pair<String, Int>? {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
++        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
++            ?: return null
++        val info = runCatching { cm.defaultProxy }.getOrNull() ?: return null
++        val host = info.host?.trim().orEmpty()
++        val port = info.port
++        if (host.isEmpty() || port <= 0) return null
++        // A hostname proxy would itself need DNS to be reachable — exactly what is
++        // broken on a proxy-only hotspot. NetShare always shows an IP literal.
++        if (!isIpLiteral(host)) {
++            Log.w(TAG, "System proxy host '$host' is not an IP literal; ignoring for mpv")
++            return null
++        }
++        return host to port
++    }
++
++    /**
++     * The `http-proxy` value to give libmpv for [url], or null when the URL must
++     * (or can safely) be fetched directly: non-HTTP schemes, loopback targets,
++     * and LAN/private targets (Jellyfin/Emby servers) stay direct so local
++     * playback keeps working, with or without a proxy.
++     */
++    fun mpvProxyForUrl(context: Context, url: String): String? {
++        val scheme = url.substringBefore(':', "").lowercase()
++        if (scheme != "http" && scheme != "https") return null
++        // URI.getHost() keeps brackets on IPv6 literals ("[::1]").
++        val host = runCatching { URI(url).host?.lowercase() }.getOrNull().orEmpty()
++        if (host.isEmpty()) return null
++        if (host == "localhost" || host == "::1" || host == "[::1]" || host == "127.0.0.1") return null
++        val proxy = defaultProxy(context) ?: return null
++        if (isPrivateTarget(host)) return null
++        return "http://${proxy.first}:${proxy.second}"
++    }
++
++    /** True when the host is a loopback or private/LAN address literal. */
++    private fun isPrivateTarget(host: String): Boolean {
++        if (!isIpLiteral(host)) {
++            // mDNS / local suffixes resolve via multicast, not DNS — keep direct.
++            return host.endsWith(".local") || host.endsWith(".lan")
++        }
++        val parts = host.split('.')
++        if (parts.size != 4) return false // IPv6 literal — public in practice
++        val octets = parts.map { it.toInt() }
++        return when {
++            octets[0] == 10 -> true
++            octets[0] == 172 && octets[1] in 16..31 -> true
++            octets[0] == 192 && octets[1] == 168 -> true
++            octets[0] == 169 && octets[1] == 254 -> true
++            else -> false
++        }
++    }
++
++    private fun isIpLiteral(host: String): Boolean {
++        val match = IPV4_REGEX.matchEntire(host) ?: return host.contains(':')
++        return match.groupValues.drop(1).all { it.toInt() in 0..255 }
++    }
++}
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
+index 29d28f43..2ea542c9 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
+@@ -3,7 +3,7 @@ package com.nuvio.app.features.addons
+ import android.content.Context
+ import android.content.SharedPreferences
+ import com.nuvio.app.core.diagnostics.SentryNetworkBreadcrumbInterceptor
+-import com.nuvio.app.core.network.IPv4FirstDns
++import com.nuvio.app.core.network.ResilientDns
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+@@ -20,7 +20,6 @@ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import okhttp3.RequestBody.Companion.toRequestBody
+-import java.net.Proxy
+ import java.io.ByteArrayOutputStream
+ import java.io.File
+ import java.io.InputStream
+@@ -102,14 +101,20 @@ internal object AddonHttpClientProvider {
+ 
+ private fun buildAddonHttpClient(cache: Cache? = null): OkHttpClient =
+     OkHttpClient.Builder()
+-        .dns(IPv4FirstDns())
++        // ResilientDns: direct lookups fall back to DoH when the network has no
++        // working DNS (NetShare-style proxy-only hotspots).
++        .dns(ResilientDns())
+         .connectTimeout(60, TimeUnit.SECONDS)
+         .readTimeout(60, TimeUnit.SECONDS)
+         .writeTimeout(60, TimeUnit.SECONDS)
+         .followRedirects(true)
+         .followSslRedirects(true)
+         .addInterceptor(SentryNetworkBreadcrumbInterceptor())
+-        .proxy(Proxy.NO_PROXY)
++        // NO_PROXY removed: it hard-bypassed the Android system HTTP proxy, so on
++        // NetShare-style proxy-only hotspots (no local DNS, Wi-Fi proxy as the only
++        // route out) every addon/plugin request froze. Without this line OkHttp
++        // uses the default ProxySelector — the system proxy when one is set, direct
++        // otherwise. Loopback targets are never proxied by Android's selector.
+         .apply {
+             if (cache != null) {
+                 cache(cache)
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
+index 9c2dd19b..d6dcec27 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
+@@ -12,8 +12,13 @@ import kotlinx.coroutines.ensureActive
+ import okhttp3.Call
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
++import com.nuvio.app.core.network.ResilientDns
+ 
+ internal val downloadHttpClient = OkHttpClient.Builder()
++    // ResilientDns: proxied requests skip DNS entirely (OkHttp default), and
++    // direct lookups fall back to DoH when the network has no working DNS
++    // (NetShare-style proxy-only hotspots).
++    .dns(ResilientDns())
+     .connectTimeout(60, TimeUnit.SECONDS)
+     .readTimeout(60, TimeUnit.SECONDS)
+     .writeTimeout(60, TimeUnit.SECONDS)
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
+index 9ec8dd16..8f482be7 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
+@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.viewinterop.AndroidView
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.lifecycle.Lifecycle
++import com.nuvio.app.core.network.SystemProxy
+ import com.nuvio.app.features.streams.redactedForLogs
+ import kotlinx.coroutines.runBlocking
+ import nuvio.composeapp.generated.resources.*
+@@ -1646,6 +1647,7 @@ private class NuvioLibmpvView(
+ 
+     private fun loadCurrentSourceNow(playWhenReady: Boolean) {
+         val sourceUrl = currentSourceUrl ?: return
++        applyMpvProxyNow(sourceUrl)
+         applyRequestHeadersNow(currentRequestHeaders)
+         setPausedNow(!playWhenReady)
+         mpv.setPropertyString("aid", "auto")
+@@ -1656,6 +1658,22 @@ private class NuvioLibmpvView(
+         setPausedNow(!playWhenReady)
+     }
+ 
++    /**
++     * NetShare-style proxy-only hotspots: libmpv ignores the Android system HTTP
++     * proxy and resolves DNS itself, which blocks forever on a network that has
++     * no working DNS (Android Private DNS / DoT cannot run there either). Hand
++     * mpv the same proxy every OkHttp request already uses, so playback works
++     * with zero local DNS. No-op on normal networks (no system proxy), and
++     * loopback/LAN targets stay direct — see SystemProxy.mpvProxyForUrl.
++     */
++    private fun applyMpvProxyNow(url: String) {
++        val proxy = runCatching { SystemProxy.mpvProxyForUrl(context, url) }.getOrNull()
++        mpv.setPropertyString("http-proxy", proxy ?: "")
++        if (proxy != null) {
++            Log.i("PlayerEngine", "libmpv using system HTTP proxy for stream")
++        }
++    }
++
+     fun attachStartupSubtitles() {
+         executeMpv {
+             currentExternalSubtitles.forEachIndexed { index, subtitle ->
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
+index 03233077..be877963 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
+@@ -5,7 +5,7 @@ import androidx.media3.datasource.DataSource
+ import androidx.media3.datasource.DefaultDataSource
+ import androidx.media3.datasource.okhttp.OkHttpDataSource
+ import com.nuvio.app.core.diagnostics.SentryNetworkBreadcrumbInterceptor
+-import com.nuvio.app.core.network.IPv4FirstDns
++import com.nuvio.app.core.network.ResilientDns
+ import okhttp3.OkHttpClient
+ import java.net.HttpURLConnection
+ import java.net.URL
+@@ -45,7 +45,10 @@ internal object PlayerPlaybackNetworking {
+ 
+     private val playbackHttpClient: OkHttpClient by lazy {
+         OkHttpClient.Builder()
+-            .dns(IPv4FirstDns())
++            // ResilientDns: proxied requests skip DNS entirely (OkHttp default),
++            // and direct lookups fall back to DoH when the network has no working
++            // DNS (NetShare-style proxy-only hotspots).
++            .dns(ResilientDns())
+             .sslSocketFactory(sslContext.socketFactory, trustAllManager)
+             .hostnameVerifier(playbackHostnameVerifier)
+             .connectTimeout(15, TimeUnit.SECONDS)
