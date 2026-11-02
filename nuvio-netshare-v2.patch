@@ -1,0 +1,735 @@
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
+old mode 100644
+new mode 100755
+index eee68bd..c2e65b5
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
+@@ -62,6 +62,7 @@ import com.nuvio.app.features.simkl.SimklSyncStorage
+ import com.nuvio.app.features.tmdb.TmdbSettingsStorage
+ import com.nuvio.app.features.updater.AndroidAppUpdaterPlatform
+ import com.nuvio.app.core.ui.CardDepthStyleStorage
++import com.nuvio.app.features.streams.StreamSourceFilterStorage
+ import com.nuvio.app.core.ui.PosterCardStyleStorage
+ import com.nuvio.app.core.poster.CustomPosterUrlStorage
+ import com.nuvio.app.features.watched.WatchedStorage
+@@ -117,6 +118,7 @@ open class MainActivity : AppCompatActivity() {
+         PosterCardStyleStorage.initialize(applicationContext)
+         CustomPosterUrlStorage.initialize(applicationContext)
+         CardDepthStyleStorage.initialize(applicationContext)
++        StreamSourceFilterStorage.initialize(applicationContext)
+         DebridSettingsStorage.initialize(applicationContext)
+         TmdbSettingsStorage.initialize(applicationContext)
+         MdbListSettingsStorage.initialize(applicationContext)
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt
+new file mode 100644
+index 0000000..08f6f35
+--- /dev/null
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt
+@@ -0,0 +1,26 @@
++package com.nuvio.app.features.streams
++
++import android.content.Context
++import android.content.SharedPreferences
++import com.nuvio.app.core.storage.ProfileScopedKey
++
++internal actual object StreamSourceFilterStorage {
++    private const val preferencesName = "nuvio_stream_source_filters"
++    private const val payloadKey = "stream_source_filters_payload"
++
++    private var preferences: SharedPreferences? = null
++
++    fun initialize(context: Context) {
++        preferences = context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
++    }
++
++    actual fun loadPayload(): String? =
++        preferences?.getString(ProfileScopedKey.of(payloadKey), null)
++
++    actual fun savePayload(payload: String) {
++        preferences
++            ?.edit()
++            ?.putString(ProfileScopedKey.of(payloadKey), payload)
++            ?.apply()
++    }
++}
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
+old mode 100644
+new mode 100755
+index 3747d1e..92fe9c4
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
+@@ -46,6 +46,7 @@ import com.nuvio.app.core.ui.NuvioTokens
+ import com.nuvio.app.core.ui.nuvio
+ import com.nuvio.app.features.details.MetaVideo
+ import com.nuvio.app.features.streams.StreamItem
++import com.nuvio.app.features.streams.StreamQualityLanguageFilterRow
+ import com.nuvio.app.features.streams.StreamsUiState
+ import com.nuvio.app.features.watchprogress.WatchProgressEntry
+ import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
+@@ -484,6 +485,15 @@ private fun EpisodeStreamsPanelContent(
+             onRefresh = onReload,
+         )
+ 
++        StreamQualityLanguageFilterRow(
++            groups = streamsUiState.groups,
++            selectedQuality = streamsUiState.qualityFilter,
++            selectedLanguage = streamsUiState.languageFilter,
++            onQualitySelected = { PlayerStreamsRepository.setEpisodeStreamsQualityFilter(it) },
++            onLanguageSelected = { PlayerStreamsRepository.setEpisodeStreamsLanguageFilter(it) },
++            modifier = Modifier.padding(top = 8.dp),
++        )
++
+         Spacer(Modifier.height(16.dp))
+ 
+         PlayerStreamList(
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
+old mode 100644
+new mode 100755
+index f547f21..2eea2af
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
+@@ -13,6 +13,7 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import com.nuvio.app.core.ui.nuvio
+ import com.nuvio.app.features.streams.StreamItem
++import com.nuvio.app.features.streams.StreamQualityLanguageFilterRow
+ import com.nuvio.app.features.streams.StreamsUiState
+ import nuvio.composeapp.generated.resources.Res
+ import nuvio.composeapp.generated.resources.action_close
+@@ -87,6 +88,15 @@ fun PlayerSourcesPanel(
+                 onRefresh = onReload,
+             )
+ 
++            StreamQualityLanguageFilterRow(
++                groups = streamsUiState.groups,
++                selectedQuality = streamsUiState.qualityFilter,
++                selectedLanguage = streamsUiState.languageFilter,
++                onQualitySelected = { PlayerStreamsRepository.setSourceQualityFilter(it) },
++                onLanguageSelected = { PlayerStreamsRepository.setSourceLanguageFilter(it) },
++                modifier = Modifier.padding(top = 8.dp),
++            )
++
+             Spacer(Modifier.height(16.dp))
+ 
+             PlayerStreamList(
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
+old mode 100644
+new mode 100755
+index 55a3dae..1ef7b56
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
+@@ -20,6 +20,8 @@ import com.nuvio.app.features.streams.InstalledStreamAddonTarget
+ import com.nuvio.app.features.streams.StreamAutoPlaySelector
+ import com.nuvio.app.features.streams.StreamBadgePresentation
+ import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
++import com.nuvio.app.features.streams.StreamQualityFilter
++import com.nuvio.app.features.streams.StreamSourceFilterPrefs
+ import com.nuvio.app.features.streams.StreamItem
+ import com.nuvio.app.features.streams.StreamLoadCompletion
+ import com.nuvio.app.features.streams.StreamParser
+@@ -53,13 +55,21 @@ object PlayerStreamsRepository {
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+ 
+     // source panel
+-    private val _sourceState = MutableStateFlow(StreamsUiState())
++    private fun seedStreamFilters(): StreamsUiState {
++        val prefs = StreamSourceFilterPrefs.state.value
++        return StreamsUiState(
++            qualityFilter = StreamQualityFilter.fromLabel(prefs.quality),
++            languageFilter = prefs.language,
++        )
++    }
++
++    private val _sourceState = MutableStateFlow(seedStreamFilters())
+     val sourceState: StateFlow<StreamsUiState> = _sourceState.asStateFlow()
+     private var sourceJob: Job? = null
+     private var sourceRequestKey: String? = null
+ 
+     // episode streams panel
+-    private val _episodeStreamsState = MutableStateFlow(StreamsUiState())
++    private val _episodeStreamsState = MutableStateFlow(seedStreamFilters())
+     val episodeStreamsState: StateFlow<StreamsUiState> = _episodeStreamsState.asStateFlow()
+     private var episodeStreamsJob: Job? = null
+     private var episodeStreamsRequestKey: String? = null
+@@ -161,6 +171,26 @@ object PlayerStreamsRepository {
+         _episodeStreamsState.update { it.copy(selectedFilter = addonId) }
+     }
+ 
++    fun setSourceQualityFilter(value: StreamQualityFilter?) {
++        _sourceState.update { it.copy(qualityFilter = value) }
++        StreamSourceFilterPrefs.updateQuality(value?.label)
++    }
++
++    fun setSourceLanguageFilter(value: String?) {
++        _sourceState.update { it.copy(languageFilter = value) }
++        StreamSourceFilterPrefs.updateLanguage(value)
++    }
++
++    fun setEpisodeStreamsQualityFilter(value: StreamQualityFilter?) {
++        _episodeStreamsState.update { it.copy(qualityFilter = value) }
++        StreamSourceFilterPrefs.updateQuality(value?.label)
++    }
++
++    fun setEpisodeStreamsLanguageFilter(value: String?) {
++        _episodeStreamsState.update { it.copy(languageFilter = value) }
++        StreamSourceFilterPrefs.updateLanguage(value)
++    }
++
+     fun clearEpisodeStreams() {
+         PluginRepository.setLocalPluginSearchPaused(true)
+         episodeStreamsJob?.cancel()
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
+old mode 100644
+new mode 100755
+index 28bee25..9f65913
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
+@@ -134,6 +134,28 @@ data class StreamItem(
+ 
+     val needsServerPreparation: Boolean
+         get() = serverTarget != null && playableDirectUrl == null
++
++    internal val sourceFilterText: String by lazy {
++        buildString {
++            append(name.orEmpty())
++            append(' ')
++            append(title.orEmpty())
++            append(' ')
++            append(streamType.orEmpty())
++            append(' ')
++            append(clientResolve?.stream?.raw?.parsed?.quality.orEmpty())
++            append(' ')
++            append(clientResolve?.stream?.raw?.parsed?.resolution.orEmpty())
++            badges.forEach { badge ->
++                append(' ')
++                append(badge.name)
++            }
++        }
++    }
++
++    val sourceFilterQualities: Set<StreamQualityFilter> by lazy { deriveSourceFilterQualities(this) }
++
++    val sourceFilterLanguages: Set<String> by lazy { deriveSourceFilterLanguages(this) }
+ }
+ 
+ @Serializable
+@@ -318,6 +340,8 @@ data class StreamsUiState(
+     val groups: List<AddonStreamGroup> = emptyList(),
+     val activeAddonIds: Set<String> = emptySet(),
+     val selectedFilter: String? = null,
++    val qualityFilter: StreamQualityFilter? = null,
++    val languageFilter: String? = null,
+     val isAnyLoading: Boolean = false,
+     val emptyStateReason: StreamsEmptyStateReason? = null,
+     val autoPlayStream: StreamItem? = null,
+@@ -327,8 +351,21 @@ data class StreamsUiState(
+     val overlayMessage: String? = null,
+ ) {
+     val filteredGroups: List<AddonStreamGroup>
+-        get() = if (selectedFilter == null) groups
+-                else groups.filter { it.addonId == selectedFilter }
++        get() {
++            val base = if (selectedFilter == null) groups
++            else groups.filter { it.addonId == selectedFilter }
++            if (qualityFilter == null && languageFilter == null) return base
++            return base
++                .map { group ->
++                    group.copy(
++                        streams = group.streams.filter { stream ->
++                            (qualityFilter == null || qualityFilter in stream.sourceFilterQualities) &&
++                                (languageFilter == null || languageFilter in stream.sourceFilterLanguages)
++                        },
++                    )
++                }
++                .filter { it.streams.isNotEmpty() || it.isLoading }
++        }
+ 
+     val allStreams: List<StreamItem>
+         get() = filteredGroups.flatMap { it.streams }
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt
+new file mode 100644
+index 0000000..f813ea2
+--- /dev/null
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt
+@@ -0,0 +1,6 @@
++package com.nuvio.app.features.streams
++
++internal expect object StreamSourceFilterStorage {
++    fun loadPayload(): String?
++    fun savePayload(payload: String)
++}
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt
+new file mode 100644
+index 0000000..29a24a5
+--- /dev/null
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt
+@@ -0,0 +1,363 @@
++package com.nuvio.app.features.streams
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyRow
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material3.FilterChip
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++
++/**
++ * Quality buckets used by the source filter row. Buckets are derived from the
++ * stream name/title/badges, so they work for every addon and debrid provider
++ * without extra metadata support.
++ */
++enum class StreamQualityFilter(val label: String) {
++    ULTRA("4K"),
++    FHD("1080p"),
++    HD("720p"),
++    SD("SD");
++
++    companion object {
++        val DISPLAY_ORDER: List<StreamQualityFilter> = listOf(ULTRA, FHD, HD, SD)
++
++        fun fromLabel(label: String?): StreamQualityFilter? =
++            label?.trim()?.takeIf { it.isNotEmpty() }
++                ?.let { candidate -> entries.firstOrNull { it.label.equals(candidate, ignoreCase = true) } }
++    }
++}
++
++private val QUALITY_TOKEN_PATTERNS: Map<StreamQualityFilter, List<Regex>> = mapOf(
++    StreamQualityFilter.ULTRA to listOf(
++        Regex("\\b4k\\b", RegexOption.IGNORE_CASE),
++        Regex("\\b2160p?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\buhd\\b", RegexOption.IGNORE_CASE),
++    ),
++    StreamQualityFilter.FHD to listOf(
++        Regex("\\b1080[pi]?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfull[\\s._-]?hd\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfhd\\b", RegexOption.IGNORE_CASE),
++    ),
++    StreamQualityFilter.HD to listOf(
++        Regex("\\b720p?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bhdrip\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bhd\\b", RegexOption.IGNORE_CASE),
++    ),
++    StreamQualityFilter.SD to listOf(
++        Regex("\\b480p?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\b360p?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\b480i\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bdvdrip\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bcamrip\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bcam\\b", RegexOption.IGNORE_CASE),
++    ),
++)
++
++private val LANGUAGE_TOKEN_PATTERNS: Map<String, List<Regex>> = linkedMapOf(
++    "English" to listOf(
++        Regex("\\benglish\\b", RegexOption.IGNORE_CASE),
++        Regex("\\beng\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Hindi" to listOf(
++        Regex("\\bhindi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bhin\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Tamil" to listOf(
++        Regex("\\btamil\\b", RegexOption.IGNORE_CASE),
++        Regex("\\btam\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Telugu" to listOf(
++        Regex("\\btelugu\\b", RegexOption.IGNORE_CASE),
++        Regex("\\btel\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Malayalam" to listOf(
++        Regex("\\bmalayalam\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bmal\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Kannada" to listOf(
++        Regex("\\bkannada\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bkan\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Bengali" to listOf(
++        Regex("\\bbengali\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bbangla\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bben\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Marathi" to listOf(
++        Regex("\\bmarathi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bmar\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Punjabi" to listOf(
++        Regex("\\bpunjabi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bpanjabi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bpan\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Gujarati" to listOf(
++        Regex("\\bgujarati\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bguj\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Urdu" to listOf(
++        Regex("\\burdu\\b", RegexOption.IGNORE_CASE),
++        Regex("\\burd\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Spanish" to listOf(
++        Regex("\\bspanish\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bespanol\\b", RegexOption.IGNORE_CASE),
++        Regex("\\besp\\b", RegexOption.IGNORE_CASE),
++        Regex("\\blatino\\b", RegexOption.IGNORE_CASE),
++    ),
++    "French" to listOf(
++        Regex("\\bfrench\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfra\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfre\\b", RegexOption.IGNORE_CASE),
++    ),
++    "German" to listOf(
++        Regex("\\bgerman\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bger\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bdeu\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Italian" to listOf(
++        Regex("\\bitalian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bita\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Portuguese" to listOf(
++        Regex("\\bportuguese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bportuguês\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bpor\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bbrazilian\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Russian" to listOf(
++        Regex("\\brussian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\brus\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Japanese" to listOf(
++        Regex("\\bjapanese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bjpn\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Korean" to listOf(
++        Regex("\\bkorean\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bkor\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Chinese" to listOf(
++        Regex("\\bchinese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bmandarin\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bchi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bzho\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Cantonese" to listOf(
++        Regex("\\bcantonese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\byue\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Arabic" to listOf(
++        Regex("\\barabic\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bara\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Turkish" to listOf(
++        Regex("\\bturkish\\b", RegexOption.IGNORE_CASE),
++        Regex("\\btur\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Dutch" to listOf(
++        Regex("\\bdutch\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bdut\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bnld\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Polish" to listOf(
++        Regex("\\bpolish\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bpol\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Indonesian" to listOf(
++        Regex("\\bindonesian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bbahasa\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Vietnamese" to listOf(
++        Regex("\\bvietnamese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bvie\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Thai" to listOf(
++        Regex("\\bthai\\b", RegexOption.IGNORE_CASE),
++        Regex("\\btha\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Tagalog" to listOf(
++        Regex("\\btagalog\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfilipino\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Ukrainian" to listOf(
++        Regex("\\bukrainian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bukr\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Persian" to listOf(
++        Regex("\\bpersian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfarsi\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Hebrew" to listOf(
++        Regex("\\bhebrew\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Nepali" to listOf(
++        Regex("\\bnepali\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bnep\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Sinhala" to listOf(
++        Regex("\\bsinhala\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bsin\\b", RegexOption.IGNORE_CASE),
++    ),
++)
++
++fun deriveSourceFilterQualities(item: StreamItem): Set<StreamQualityFilter> {
++    val text = item.sourceFilterText
++    if (text.isBlank()) return emptySet()
++    return StreamQualityFilter.DISPLAY_ORDER.filter { filter ->
++        QUALITY_TOKEN_PATTERNS[filter].orEmpty().any { pattern -> pattern.containsMatchIn(text) }
++    }.toSet()
++}
++
++fun deriveSourceFilterLanguages(item: StreamItem): Set<String> {
++    val text = item.sourceFilterText
++    if (text.isBlank()) return emptySet()
++    return LANGUAGE_TOKEN_PATTERNS.filterValues { patterns ->
++        patterns.any { pattern -> pattern.containsMatchIn(text) }
++    }.keys
++}
++
++data class StreamSourceFilterState(
++    val quality: String? = null,
++    val language: String? = null,
++)
++
++/**
++ * Process-wide holder for the persisted source filter preference. Loaded from
++ * platform storage on first touch, saved on every change, and used to seed the
++ * stream lists so the preferred quality/language is active immediately.
++ */
++object StreamSourceFilterPrefs {
++    private val _state = MutableStateFlow(loadPersistedState())
++    val state: StateFlow<StreamSourceFilterState> = _state.asStateFlow()
++
++    private fun loadPersistedState(): StreamSourceFilterState {
++        val payload = runCatching { StreamSourceFilterStorage.loadPayload() }.getOrNull().orEmpty()
++        var quality: String? = null
++        var language: String? = null
++        payload.split('|').forEach { segment ->
++            val separator = segment.indexOf('=')
++            if (separator <= 0) return@forEach
++            val value = segment.substring(separator + 1).trim().takeIf { it.isNotEmpty() } ?: return@forEach
++            when (segment.substring(0, separator).trim()) {
++                "q" -> quality = value
++                "l" -> language = value
++            }
++        }
++        return StreamSourceFilterState(quality = quality, language = language)
++    }
++
++    fun updateQuality(label: String?) {
++        _state.update { it.copy(quality = label?.trim()?.takeIf { value -> value.isNotEmpty() }) }
++        persist()
++    }
++
++    fun updateLanguage(language: String?) {
++        _state.update { it.copy(language = language?.trim()?.takeIf { value -> value.isNotEmpty() }) }
++        persist()
++    }
++
++    private fun persist() {
++        val current = _state.value
++        val payload = "q=${current.quality.orEmpty()}|l=${current.language.orEmpty()}"
++        runCatching { StreamSourceFilterStorage.savePayload(payload) }
++    }
++}
++
++internal data class StreamSourceFilterAvailability(
++    val qualities: List<StreamQualityFilter>,
++    val languages: List<String>,
++)
++
++internal fun List<AddonStreamGroup>.deriveStreamSourceFilterAvailability(): StreamSourceFilterAvailability {
++    val streams = flatMap { it.streams }
++    if (streams.isEmpty()) return StreamSourceFilterAvailability(emptyList(), emptyList())
++    val qualities = StreamQualityFilter.DISPLAY_ORDER.filter { quality ->
++        streams.any { quality in it.sourceFilterQualities }
++    }
++    val counts = LinkedHashMap<String, Int>()
++    streams.forEach { stream ->
++        stream.sourceFilterLanguages.forEach { language ->
++            counts[language] = (counts[language] ?: 0) + 1
++        }
++    }
++    val languages = counts.entries.sortedByDescending { it.value }.map { it.key }
++    return StreamSourceFilterAvailability(qualities, languages)
++}
++
++/**
++ * Compact one-tap filter row: quality chips + a divider + the languages that
++ * are actually present in the current stream list (most frequent first).
++ * Tapping a selected chip clears that filter. Shown only when there is
++ * something to filter on, so it never adds visual noise.
++ */
++@Composable
++internal fun StreamQualityLanguageFilterRow(
++    groups: List<AddonStreamGroup>,
++    selectedQuality: StreamQualityFilter?,
++    selectedLanguage: String?,
++    onQualitySelected: (StreamQualityFilter?) -> Unit,
++    onLanguageSelected: (String?) -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val availability = remember(groups) { groups.deriveStreamSourceFilterAvailability() }
++    if (availability.qualities.isEmpty() && availability.languages.isEmpty()) return
++    LazyRow(
++        modifier = modifier.fillMaxWidth(),
++        horizontalArrangement = Arrangement.spacedBy(6.dp),
++        contentPadding = PaddingValues(horizontal = 2.dp),
++    ) {
++        items(availability.qualities) { quality ->
++            FilterChip(
++                selected = selectedQuality == quality,
++                onClick = { onQualitySelected(if (selectedQuality == quality) null else quality) },
++                label = {
++                    Text(
++                        text = quality.label,
++                        style = MaterialTheme.typography.labelMedium,
++                        maxLines = 1,
++                    )
++                },
++            )
++        }
++        if (availability.qualities.isNotEmpty() && availability.languages.isNotEmpty()) {
++            item {
++                Text(
++                    text = "•",
++                    style = MaterialTheme.typography.labelMedium,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
++                    modifier = Modifier.padding(horizontal = 2.dp),
++                )
++            }
++        }
++        items(availability.languages.take(8)) { language ->
++            FilterChip(
++                selected = selectedLanguage.equals(language, ignoreCase = true),
++                onClick = {
++                    onLanguageSelected(
++                        if (selectedLanguage.equals(language, ignoreCase = true)) null else language,
++                    )
++                },
++                label = {
++                    Text(
++                        text = language,
++                        style = MaterialTheme.typography.labelMedium,
++                        maxLines = 1,
++                    )
++                },
++            )
++        }
++    }
++}
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
+old mode 100644
+new mode 100755
+index 58fd52c..1c2360d
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
+@@ -33,7 +33,16 @@ import kotlinx.coroutines.launch
+ object StreamsRepository {
+     private val log = Logger.withTag("StreamsRepo")
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+-    private val _uiState = MutableStateFlow(StreamsUiState())
++
++    private fun seedStreamFilters(): StreamsUiState {
++        val prefs = StreamSourceFilterPrefs.state.value
++        return StreamsUiState(
++            qualityFilter = StreamQualityFilter.fromLabel(prefs.quality),
++            languageFilter = prefs.language,
++        )
++    }
++
++    private val _uiState = MutableStateFlow(seedStreamFilters())
+     val uiState: StateFlow<StreamsUiState> = _uiState.asStateFlow()
+ 
+     private var activeJob: Job? = null
+@@ -647,6 +656,16 @@ object StreamsRepository {
+         _uiState.update { it.copy(selectedFilter = addonId) }
+     }
+ 
++    fun setQualityFilter(value: StreamQualityFilter?) {
++        _uiState.update { it.copy(qualityFilter = value) }
++        StreamSourceFilterPrefs.updateQuality(value?.label)
++    }
++
++    fun setLanguageFilter(value: String?) {
++        _uiState.update { it.copy(languageFilter = value) }
++        StreamSourceFilterPrefs.updateLanguage(value)
++    }
++
+     fun consumeAutoPlay() {
+         activeRequestKey = null
+         _uiState.update {
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
+old mode 100644
+new mode 100755
+index c003a58..95c73eb
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
+@@ -497,6 +497,15 @@ private fun MobileStreamsLayout(
+                         onRefresh = onRefresh,
+                     )
+ 
++                    StreamQualityLanguageFilterRow(
++                        groups = uiState.groups,
++                        selectedQuality = uiState.qualityFilter,
++                        selectedLanguage = uiState.languageFilter,
++                        onQualitySelected = { StreamsRepository.setQualityFilter(it) },
++                        onLanguageSelected = { StreamsRepository.setLanguageFilter(it) },
++                        modifier = Modifier.padding(top = 8.dp),
++                    )
++
+                     StreamList(
+                         uiState = uiState,
+                         debridEnabled = debridEnabled,
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
+old mode 100644
+new mode 100755
+index 956cdbf..4bac06b
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
+@@ -210,6 +210,15 @@ internal fun TabletStreamsLayout(
+                             onRefresh = onRefresh,
+                         )
+ 
++                        StreamQualityLanguageFilterRow(
++                            groups = uiState.groups,
++                            selectedQuality = uiState.qualityFilter,
++                            selectedLanguage = uiState.languageFilter,
++                            onQualitySelected = { StreamsRepository.setQualityFilter(it) },
++                            onLanguageSelected = { StreamsRepository.setLanguageFilter(it) },
++                            modifier = Modifier.padding(top = 8.dp),
++                        )
++
+                         ActiveScrapersStatusBlock(
+                             groups = uiState.groups,
+                             modifier = Modifier.padding(bottom = 4.dp),
+diff --git a/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt
+new file mode 100644
+index 0000000..1f28f57
+--- /dev/null
++++ b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt
+@@ -0,0 +1,15 @@
++package com.nuvio.app.features.streams
++
++import com.nuvio.app.core.storage.ProfileScopedKey
++import platform.Foundation.NSUserDefaults
++
++internal actual object StreamSourceFilterStorage {
++    private const val payloadKey = "stream_source_filters_payload"
++
++    actual fun loadPayload(): String? =
++        NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of(payloadKey))
++
++    actual fun savePayload(payload: String) {
++        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of(payloadKey))
++    }
++}
