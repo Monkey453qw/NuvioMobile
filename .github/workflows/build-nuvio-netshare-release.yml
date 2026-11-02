@@ -1,0 +1,78 @@
+name: Build Nuvio (NetShare patch, release)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout default branch (bundle files live here)
+        uses: actions/checkout@v6
+
+      - name: Pin source tree to the commit the patch targets
+        run: |
+          mkdir -p /tmp/bundle
+          mv nuvio-netshare-support.patch runtime-local.properties /tmp/bundle/
+          git fetch --depth=1 origin 10feb659ae3368008a584316bd5e1d2665e3aa6c
+          git checkout -f --detach FETCH_HEAD
+          mv /tmp/bundle/nuvio-netshare-support.patch /tmp/bundle/runtime-local.properties .
+          for f in nuvio-netshare-support.patch runtime-local.properties; do
+            test -f "$f" || { echo "MISSING BUNDLE FILE: $f"; exit 1; }
+          done
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Restore release keystore
+        env:
+          NVS_KS_B64: ${{ secrets.NVS_KS_B64 }}
+        run: |
+          echo "$NVS_KS_B64" | base64 -d > nuvio-release.jks
+          test -s nuvio-release.jks || { echo "EMPTY KEYSTORE"; exit 1; }
+
+      - name: Apply NetShare patch
+        run: git apply nuvio-netshare-support.patch
+
+      - name: Prepare local.properties (client config + release signing)
+        env:
+          NVS_KS_PASS: ${{ secrets.NVS_KS_PASS }}
+          NVS_KEY_ALIAS: ${{ secrets.NVS_KEY_ALIAS }}
+          NVS_KEY_PASS: ${{ secrets.NVS_KEY_PASS }}
+        run: |
+          cp runtime-local.properties local.properties
+          {
+            echo ""
+            echo "NUVIO_RELEASE_STORE_FILE=nuvio-release.jks"
+            echo "NUVIO_RELEASE_STORE_PASSWORD=$NVS_KS_PASS"
+            echo "NUVIO_RELEASE_KEY_ALIAS=$NVS_KEY_ALIAS"
+            echo "NUVIO_RELEASE_KEY_PASSWORD=$NVS_KEY_PASS"
+          } >> local.properties
+
+      - name: Build fullRelease APK (minified, arm64 split)
+        run: ./gradlew :androidApp:assembleFullRelease -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore --stacktrace
+
+      - name: Show outputs
+        run: |
+          ls -la androidApp/build/outputs/apk/full/release/
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          APK=$(ls androidApp/build/outputs/apk/full/release/*arm64-v8a*.apk | head -1)
+          "$ANDROID_HOME/build-tools/$BT/aapt2" dump badging "$APK" | head -3 || true
+
+      - name: Upload APK (arm64-v8a)
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuvio-netshare-release
+          path: androidApp/build/outputs/apk/full/release/*arm64-v8a*.apk
+          archive: false
+          if-no-files-found: error
