@@ -17,11 +17,11 @@ jobs:
       - name: Pin source tree to the commit the patch targets
         run: |
           mkdir -p /tmp/bundle
-          mv nuvio-netshare-support.patch runtime-local.properties /tmp/bundle/
+          mv nuvio-netshare-support.patch nuvio-netshare-v2.patch runtime-local.properties /tmp/bundle/
           git fetch --depth=1 origin 10feb659ae3368008a584316bd5e1d2665e3aa6c
           git checkout -f --detach FETCH_HEAD
-          mv /tmp/bundle/nuvio-netshare-support.patch /tmp/bundle/runtime-local.properties .
-          for f in nuvio-netshare-support.patch runtime-local.properties; do
+          mv /tmp/bundle/nuvio-netshare-support.patch /tmp/bundle/nuvio-netshare-v2.patch /tmp/bundle/runtime-local.properties .
+          for f in nuvio-netshare-support.patch nuvio-netshare-v2.patch runtime-local.properties; do
             test -f "$f" || { echo "MISSING BUNDLE FILE: $f"; exit 1; }
           done
 
@@ -43,6 +43,9 @@ jobs:
 
       - name: Apply NetShare patch
         run: git apply nuvio-netshare-support.patch
+
+      - name: Apply source filter patch
+        run: git apply nuvio-netshare-v2.patch
 
       - name: Prepare local.properties (client config + release signing)
         env:
