@@ -44,38 +44,50 @@ index c1b3aa9..d202f84 100644
          .readTimeout(2, TimeUnit.SECONDS)
          .followRedirects(true)
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
-old mode 100644
-new mode 100755
-index eee68bd..8945b28
+index eee68bd..3b14507 100644
 --- a/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
-@@ -62,6 +62,9 @@ import com.nuvio.app.features.simkl.SimklSyncStorage
+@@ -62,6 +62,7 @@ import com.nuvio.app.features.simkl.SimklSyncStorage
  import com.nuvio.app.features.tmdb.TmdbSettingsStorage
  import com.nuvio.app.features.updater.AndroidAppUpdaterPlatform
  import com.nuvio.app.core.ui.CardDepthStyleStorage
 +import com.nuvio.app.features.streams.StreamSourceFilterStorage
-+import com.nuvio.app.features.streams.SourceHealthRepository
-+import com.nuvio.app.features.streams.SourceHealthStorage
  import com.nuvio.app.core.ui.PosterCardStyleStorage
  import com.nuvio.app.core.poster.CustomPosterUrlStorage
  import com.nuvio.app.features.watched.WatchedStorage
-@@ -117,6 +120,8 @@ open class MainActivity : AppCompatActivity() {
+@@ -78,16 +79,19 @@ open class MainActivity : AppCompatActivity() {
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         installSplashScreen()
+-        enableEdgeToEdge(
+-            navigationBarStyle = SystemBarStyle.dark(
+-                scrim = 0xFF020404.toInt(),
+-            ),
+-        )
+         ThemeSettingsStorage.initialize(applicationContext)
+         AppIconPlatform.initialize(applicationContext)
+         SentrySettingsStorage.initialize(applicationContext)
+         SentryInitializer.start(application)
+         super.onCreate(savedInstanceState)
++        // Edge-to-edge must be enabled after super.onCreate so the decor window
++        // is fully created; otherwise the system bars can stay opaque on some
++        // devices and show the launcher wallpaper behind them during playback.
++        enableEdgeToEdge(
++            navigationBarStyle = SystemBarStyle.dark(
++                scrim = 0xFF020404.toInt(),
++            ),
++        )
+         AutoSyncPreferencesAndroid.initialize(applicationContext) // AutoSync hook
+         window.setBackgroundDrawableResource(R.color.nuvio_background)
+         pipRemoteActionReceiver = PipRemoteActionReceiver.register(this)
+@@ -117,6 +121,7 @@ open class MainActivity : AppCompatActivity() {
          PosterCardStyleStorage.initialize(applicationContext)
          CustomPosterUrlStorage.initialize(applicationContext)
          CardDepthStyleStorage.initialize(applicationContext)
 +        StreamSourceFilterStorage.initialize(applicationContext)
-+        SourceHealthStorage.initialize(applicationContext)
          DebridSettingsStorage.initialize(applicationContext)
          TmdbSettingsStorage.initialize(applicationContext)
          MdbListSettingsStorage.initialize(applicationContext)
-@@ -148,6 +153,7 @@ open class MainActivity : AppCompatActivity() {
-         PlatformLocalAccountDataCleaner.initialize(applicationContext)
-         EpisodeReleaseNotificationPlatform.initialize(applicationContext)
-         EpisodeReleaseNotificationPlatform.bindActivity(this)
-+        SourceHealthRepository.bootstrap()
-         handleIncomingAppIntent(intent)
- 
-         setContent {
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt
 new file mode 100644
 index 0000000..f62e12c
@@ -335,6 +347,49 @@ index 9ec8dd1..8f482be 100644
      fun attachStartupSubtitles() {
          executeMpv {
              currentExternalSubtitles.forEachIndexed { index, subtitle ->
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlatformEffects.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlatformEffects.android.kt
+index e0cadb8..0d487b0 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlatformEffects.android.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlatformEffects.android.kt
+@@ -64,6 +64,25 @@ actual fun HidePlayerSystemBars() {
+     DisposableEffect(window) {
+         val controller = WindowCompat.getInsetsController(window, window.decorView)
+         val previousBehavior = controller.systemBarsBehavior
++        val previousDecorBackground = window.decorView.background
++        val previousCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            window.attributes.layoutInDisplayCutoutMode
++        } else {
++            0
++        }
++
++        // Draw the player edge-to-edge over an opaque black surface. This keeps
++        // the status/navigation bar strips black instead of letting the window
++        // (or the launcher wallpaper behind a transparent system bar) show.
++        WindowCompat.setDecorFitsSystemWindows(window, false)
++        window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
++        window.decorView.setBackgroundColor(android.graphics.Color.BLACK)
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            window.attributes = window.attributes.apply {
++                layoutInDisplayCutoutMode =
++                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
++            }
++        }
+ 
+         controller.hide(WindowInsetsCompat.Type.systemBars())
+         controller.systemBarsBehavior =
+@@ -72,6 +91,12 @@ actual fun HidePlayerSystemBars() {
+         onDispose {
+             controller.show(WindowInsetsCompat.Type.systemBars())
+             controller.systemBarsBehavior = previousBehavior
++            window.decorView.background = previousDecorBackground
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++                window.attributes = window.attributes.apply {
++                    layoutInDisplayCutoutMode = previousCutoutMode
++                }
++            }
+         }
+     }
+ }
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
 index 0323307..be87796 100644
 --- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
@@ -360,36 +415,6 @@ index 0323307..be87796 100644
              .sslSocketFactory(sslContext.socketFactory, trustAllManager)
              .hostnameVerifier(playbackHostnameVerifier)
              .connectTimeout(15, TimeUnit.SECONDS)
-diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt
-new file mode 100644
-index 0000000..88bde0c
---- /dev/null
-+++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt
-@@ -0,0 +1,24 @@
-+package com.nuvio.app.features.streams
-+
-+import android.content.Context
-+import android.content.SharedPreferences
-+internal actual object SourceHealthStorage {
-+    private const val preferencesName = "nuvio_stream_source_health"
-+    private const val payloadKey = "stream_source_health_payload"
-+
-+    private var preferences: SharedPreferences? = null
-+
-+    fun initialize(context: Context) {
-+        preferences = context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
-+    }
-+
-+    actual fun loadPayload(): String? =
-+        preferences?.getString(payloadKey, null)
-+
-+    actual fun savePayload(payload: String) {
-+        preferences
-+            ?.edit()
-+            ?.putString(payloadKey, payload)
-+            ?.apply()
-+    }
-+}
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt
 new file mode 100644
 index 0000000..08f6f35
@@ -511,6 +536,40 @@ index 3747d1e..57f80f5
          Spacer(Modifier.height(16.dp))
  
          PlayerStreamList(
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerScreenRuntimeUi.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerScreenRuntimeUi.kt
+index 59e92f2..3ca7b66 100644
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerScreenRuntimeUi.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerScreenRuntimeUi.kt
+@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
+ import androidx.compose.animation.core.tween
+ import androidx.compose.animation.fadeIn
+ import androidx.compose.animation.fadeOut
++import androidx.compose.foundation.background
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.BoxScope
+ import androidx.compose.foundation.layout.fillMaxSize
+@@ -13,12 +14,12 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+-import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.key
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.layout.onSizeChanged
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.nuvio.app.core.ui.NuvioStatusModal
+@@ -133,6 +134,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
+     Box(
+         modifier = Modifier
+             .fillMaxSize()
++            .background(Color.Black)
+             .onSizeChanged { layoutSize = it }
+             .playerSurfaceTapGestures(
+                 layoutSize = layoutSize,
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
 old mode 100644
 new mode 100755
@@ -542,93 +601,22 @@ index f547f21..cc2c170
              Spacer(Modifier.height(16.dp))
  
              PlayerStreamList(
-diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamList.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamList.kt
-index 83d25db..cd92405 100644
---- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamList.kt
-+++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamList.kt
-@@ -12,6 +12,7 @@ import androidx.compose.material3.MaterialTheme
- import androidx.compose.material3.Text
- import androidx.compose.runtime.Composable
- import androidx.compose.runtime.CompositionLocalProvider
-+import androidx.compose.runtime.LaunchedEffect
- import androidx.compose.runtime.getValue
- import androidx.compose.runtime.remember
- import androidx.compose.ui.Alignment
-@@ -21,13 +22,17 @@ import androidx.compose.ui.unit.dp
- import androidx.lifecycle.compose.collectAsStateWithLifecycle
- import com.nuvio.app.features.debrid.DebridSettingsRepository
- import com.nuvio.app.features.streams.LocalStreamSizeLabelFormat
-+import com.nuvio.app.features.streams.SourceHealthRepository
- import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
-+import com.nuvio.app.features.streams.StreamBestSourcesSection
- import com.nuvio.app.features.streams.StreamCard
- import com.nuvio.app.features.streams.StreamCardSkeleton
- import com.nuvio.app.features.streams.StreamItem
- import com.nuvio.app.features.streams.StreamsUiState
- import com.nuvio.app.features.streams.isSelectableForPlayback
-+import com.nuvio.app.features.streams.isStreamTesting
- import com.nuvio.app.features.streams.rememberStreamSizeLabelFormat
-+import com.nuvio.app.features.streams.sourceHealthHost
- import nuvio.composeapp.generated.resources.Res
- import nuvio.composeapp.generated.resources.compose_player_no_streams_found
- import org.jetbrains.compose.resources.stringResource
-@@ -58,6 +63,10 @@ internal fun PlayerStreamList(
-     val streams = streamsUiState.allStreams
-     val visibleGroups = streamsUiState.filteredGroups
- 
-+    LaunchedEffect(streamsUiState.groups) {
-+        SourceHealthRepository.registerStreams(streamsUiState.groups.flatMap { group -> group.streams })
-+    }
-+
-     when {
-         streams.isEmpty() && streamsUiState.isAnyLoading -> {
-             Column(
-@@ -95,6 +104,17 @@ internal fun PlayerStreamList(
-                 verticalArrangement = Arrangement.spacedBy(8.dp),
-                 contentPadding = contentPadding,
-             ) {
-+                val bestSources = streamsUiState.bestSources
-+                if (bestSources.isNotEmpty()) {
-+                    item(key = "best_sources") {
-+                        StreamBestSourcesSection(
-+                            sources = bestSources,
-+                            health = streamsUiState.sourceHealth,
-+                            onStreamSelected = onStreamSelected,
-+                            modifier = Modifier.padding(bottom = 8.dp),
-+                        )
-+                    }
-+                }
-                 itemsIndexed(
-                     items = streams,
-                     key = { index, _ -> streamKeys[index] },
-@@ -109,6 +129,10 @@ internal fun PlayerStreamList(
-                         badgePlacement = streamBadgeSettings.badgePlacement,
-                         isCurrent = stream.isCurrentPlayerStream(currentStreamUrl, currentStreamName),
-                         currentLabel = currentLabel,
-+                        isTesting = streamsUiState.sourceHealth.isStreamTesting(stream),
-+                        latencyMs = stream.sourceHealthHost()?.let { host ->
-+                            streamsUiState.sourceHealth.entryFor(host).latencyMs
-+                        },
-                         onClick = { onStreamSelected(stream) },
-                     )
-                 }
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
 old mode 100644
 new mode 100755
-index 55a3dae..c829582
+index 55a3dae..bd0462f
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
-@@ -20,6 +20,9 @@ import com.nuvio.app.features.streams.InstalledStreamAddonTarget
+@@ -20,6 +20,8 @@ import com.nuvio.app.features.streams.InstalledStreamAddonTarget
  import com.nuvio.app.features.streams.StreamAutoPlaySelector
  import com.nuvio.app.features.streams.StreamBadgePresentation
  import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
 +import com.nuvio.app.features.streams.StreamQualityFilter
 +import com.nuvio.app.features.streams.StreamSourceFilterPrefs
-+import com.nuvio.app.features.streams.SourceHealthRepository
  import com.nuvio.app.features.streams.StreamItem
  import com.nuvio.app.features.streams.StreamLoadCompletion
  import com.nuvio.app.features.streams.StreamParser
-@@ -53,17 +56,28 @@ object PlayerStreamsRepository {
+@@ -53,13 +55,15 @@ object PlayerStreamsRepository {
      private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
  
      // source panel
@@ -646,20 +634,7 @@ index 55a3dae..c829582
      val episodeStreamsState: StateFlow<StreamsUiState> = _episodeStreamsState.asStateFlow()
      private var episodeStreamsJob: Job? = null
      private var episodeStreamsRequestKey: String? = null
- 
-+    init {
-+        scope.launch {
-+            SourceHealthRepository.state.collect { snapshot ->
-+                _sourceState.update { current -> current.copy(sourceHealth = snapshot) }
-+                _episodeStreamsState.update { current -> current.copy(sourceHealth = snapshot) }
-+            }
-+        }
-+    }
-+
-     fun loadSources(
-         type: String,
-         videoId: String,
-@@ -161,6 +175,50 @@ object PlayerStreamsRepository {
+@@ -161,6 +165,50 @@ object PlayerStreamsRepository {
          _episodeStreamsState.update { it.copy(selectedFilter = addonId) }
      }
  
@@ -710,431 +685,10 @@ index 55a3dae..c829582
      fun clearEpisodeStreams() {
          PluginRepository.setLocalPluginSearchPaused(true)
          episodeStreamsJob?.cancel()
-diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealth.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealth.kt
-new file mode 100644
-index 0000000..c8faf6e
---- /dev/null
-+++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealth.kt
-@@ -0,0 +1,378 @@
-+package com.nuvio.app.features.streams
-+
-+import co.touchlab.kermit.Logger
-+import com.nuvio.app.core.ui.NuvioToastController
-+import com.nuvio.app.features.addons.httpRequestRaw
-+import com.nuvio.app.features.watchprogress.CurrentDateProvider
-+import kotlinx.coroutines.CoroutineScope
-+import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.Job
-+import kotlinx.coroutines.SupervisorJob
-+import kotlinx.coroutines.delay
-+import kotlinx.coroutines.flow.MutableStateFlow
-+import kotlinx.coroutines.flow.StateFlow
-+import kotlinx.coroutines.flow.asStateFlow
-+import kotlinx.coroutines.flow.update
-+import kotlinx.coroutines.launch
-+import kotlinx.coroutines.sync.Mutex
-+import kotlinx.coroutines.sync.Semaphore
-+import kotlinx.coroutines.sync.withLock
-+import kotlinx.coroutines.sync.withPermit
-+import kotlinx.coroutines.withTimeoutOrNull
-+import kotlin.time.TimeSource
-+
-+/**
-+ * Health of a source host as measured by the background sweep. The sweep runs
-+ * once per calendar day (see [SourceHealthRepository.bootstrap]) and again for
-+ * any host the user runs into that has not been measured yet today.
-+ */
-+enum class SourceHealthStatus {
-+    /** Queued for the current sweep. */
-+    UNKNOWN,
-+
-+    /** Currently being probed. */
-+    CHECKING,
-+
-+    /** Reachable: the server answered the probe. */
-+    ONLINE,
-+
-+    /** Unreachable, timed out, or answered with an error status. */
-+    OFFLINE,
-+
-+    /** Streams that cannot be probed over HTTP (torrents, magnets, debrid). */
-+    UNPROBEABLE,
-+}
-+
-+data class SourceHealthEntry(
-+    val status: SourceHealthStatus = SourceHealthStatus.UNKNOWN,
-+    val latencyMs: Long? = null,
-+)
-+
-+data class SourceHealthSnapshot(
-+    val day: String = "",
-+    val hosts: Map<String, SourceHealthEntry> = emptyMap(),
-+    val sweeping: Boolean = false,
-+    val completed: Int = 0,
-+    val total: Int = 0,
-+) {
-+    val isRunning: Boolean
-+        get() = sweeping && completed < total
-+
-+    val progress: Float
-+        get() = if (total <= 0) 0f else (completed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
-+
-+    val onlineCount: Int
-+        get() = hosts.values.count { it.status == SourceHealthStatus.ONLINE }
-+
-+    fun entryFor(host: String?): SourceHealthEntry {
-+        if (host == null) return SourceHealthEntry(status = SourceHealthStatus.UNPROBEABLE)
-+        return hosts[host] ?: SourceHealthEntry(status = SourceHealthStatus.UNKNOWN)
-+    }
-+}
-+
-+/** True when [stream] may be listed: online, still being tested, or not probe-able. */
-+fun SourceHealthSnapshot.isStreamVisible(stream: StreamItem): Boolean {
-+    val host = stream.sourceHealthHost() ?: return true
-+    return entryFor(host).status != SourceHealthStatus.OFFLINE
-+}
-+
-+/** True while [stream] is queued or actively being probed. */
-+fun SourceHealthSnapshot.isStreamTesting(stream: StreamItem): Boolean {
-+    val host = stream.sourceHealthHost() ?: return false
-+    return when (entryFor(host).status) {
-+        SourceHealthStatus.CHECKING, SourceHealthStatus.UNKNOWN -> true
-+        else -> false
-+    }
-+}
-+
-+/**
-+ * Extracts the probe-able host of a stream. Returns null when the stream is not
-+ * an HTTP asset (magnet/torrent/debrid/YouTube) so callers can treat it as
-+ * [SourceHealthStatus.UNPROBEABLE] instead of hiding it.
-+ */
-+fun StreamItem.sourceHealthHost(): String? {
-+    val candidate = playableDirectUrl ?: return null
-+    val schemeEnd = candidate.indexOf("://")
-+    if (schemeEnd <= 0) return null
-+    val scheme = candidate.substring(0, schemeEnd).lowercase()
-+    if (scheme != "http" && scheme != "https") return null
-+    val afterScheme = candidate.substring(schemeEnd + 3)
-+    val authorityEnd = afterScheme.indexOfFirst { it == '/' || it == '?' || it == '#' }
-+    val authority = if (authorityEnd >= 0) afterScheme.substring(0, authorityEnd) else afterScheme
-+    val host = authority.substringAfter('@').substringBefore(':').trim().lowercase()
-+    return host.takeIf { it.isNotEmpty() }
-+}
-+
-+/**
-+ * Process-wide daily source health sweep.
-+ *
-+ * - [bootstrap] runs on app start: restores today's results, or starts a
-+ *   background sweep over every host seen so far when the day rolled over.
-+ *   Nothing is scheduled on the main thread and the UI stays responsive.
-+ * - [registerStreams] runs when a source list is shown: hosts without a result
-+ *   for today are queued, known hosts reuse their cached verdict.
-+ * - Only [SourceHealthStatus.OFFLINE] sources are hidden. Queued sources stay
-+ *   visible with a testing state so servers appear progressively as they pass.
-+ * - A Nuvio-styled toast is shown once per day when the launch sweep finishes.
-+ */
-+object SourceHealthRepository {
-+    private val log = Logger.withTag("SourceHealth")
-+    private const val probeTimeoutMs = 6_000L
-+    private const val maxConcurrentProbes = 6
-+
-+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-+    private val probeSemaphore = Semaphore(maxConcurrentProbes)
-+    private val bookkeeping = Mutex()
-+    private val launchedHosts = mutableSetOf<String>()
-+    private val sampleUrls = MutableStateFlow<Map<String, String>>(emptyMap())
-+
-+    private val _state = MutableStateFlow(SourceHealthSnapshot())
-+    val state: StateFlow<SourceHealthSnapshot> = _state.asStateFlow()
-+
-+    private var bootstrapped = false
-+    private var dailySweepActive = false
-+    private var lastToastedDay: String? = null
-+    private var toastJob: Job? = null
-+
-+    fun bootstrap() {
-+        if (bootstrapped) return
-+        bootstrapped = true
-+
-+        val today = CurrentDateProvider.todayIsoDate()
-+        val restored = parsePersisted(runCatching { SourceHealthStorage.loadPayload() }.getOrNull())
-+
-+        if (restored.day == today) {
-+            _state.value = SourceHealthSnapshot(
-+                day = today,
-+                hosts = restored.hosts,
-+                sweeping = false,
-+                completed = restored.hosts.size,
-+                total = restored.hosts.size,
-+            )
-+            sampleUrls.value = restored.sampleUrls
-+            log.d { "Restored ${restored.hosts.size} source health results for $today" }
-+            return
-+        }
-+
-+        if (restored.hosts.isEmpty()) {
-+            _state.value = SourceHealthSnapshot(day = today)
-+            return
-+        }
-+
-+        // New calendar day: drop yesterday's verdicts and re-test every known host.
-+        dailySweepActive = true
-+        val pending = restored.hosts.keys.map { host ->
-+            host to SourceHealthEntry(status = SourceHealthStatus.UNKNOWN)
-+        }.toMap()
-+        sampleUrls.value = restored.sampleUrls
-+        _state.value = SourceHealthSnapshot(
-+            day = today,
-+            hosts = pending,
-+            sweeping = true,
-+            completed = 0,
-+            total = pending.size,
-+        )
-+        log.d { "Starting daily source sweep for ${pending.size} hosts on $today" }
-+        pending.keys.forEach { host -> enqueue(host) }
-+    }
-+
-+    /** Queues probes for any host in [streams] that has no result for today. */
-+    fun registerStreams(streams: List<StreamItem>) {
-+        if (streams.isEmpty()) return
-+        val today = CurrentDateProvider.todayIsoDate()
-+        val toProbe = mutableListOf<String>()
-+
-+        _state.update { snapshot ->
-+            val base = if (snapshot.day == today) snapshot else SourceHealthSnapshot(day = today)
-+            val hosts = base.hosts.toMutableMap()
-+            streams.forEach { stream ->
-+                val host = stream.sourceHealthHost() ?: return@forEach
-+                val sample = stream.playableDirectUrl ?: return@forEach
-+                val previousSample = sampleUrls.value[host]
-+                val sampleChanged = previousSample != null && previousSample != sample
-+                sampleUrls.update { it + (host to sample) }
-+                val existing = hosts[host]
-+                val needsProbe = existing == null ||
-+                    existing.status == SourceHealthStatus.UNKNOWN ||
-+                    // A fresh list can hand us a new signed URL for a host we
-+                    // marked offline earlier today: give it one more chance.
-+                    (existing.status == SourceHealthStatus.OFFLINE && sampleChanged)
-+                if (needsProbe) {
-+                    hosts[host] = SourceHealthEntry(status = SourceHealthStatus.CHECKING)
-+                    toProbe += host
-+                }
-+            }
-+            base.copy(
-+                hosts = hosts,
-+                sweeping = base.sweeping || toProbe.isNotEmpty(),
-+                total = if (base.total == 0) hosts.size else maxOf(base.total, hosts.size),
-+            )
-+        }
-+
-+        toProbe.forEach { host -> enqueue(host) }
-+    }
-+
-+    private fun enqueue(host: String) {
-+        scope.launch {
-+            val claimed = bookkeeping.withLock {
-+                if (host in launchedHosts) false else {
-+                    launchedHosts += host
-+                    true
-+                }
-+            }
-+            if (!claimed) return@launch
-+            // A new probe landed before the "testing done" toast fired: hold it
-+            // back so the popup only appears once the visible list is settled.
-+            toastJob?.cancel()
-+
-+            probeSemaphore.withPermit {
-+                val sample = sampleUrls.value[host]
-+                val entry = if (sample.isNullOrBlank()) {
-+                    SourceHealthEntry(status = SourceHealthStatus.UNPROBEABLE)
-+                } else {
-+                    probe(sample)
-+                }
-+                _state.update { snapshot ->
-+                    snapshot.copy(
-+                        hosts = snapshot.hosts + (host to entry),
-+                        completed = snapshot.completed + 1,
-+                    )
-+                }
-+                bookkeeping.withLock { launchedHosts -= host }
-+                completeIfFinished()
-+            }
-+        }
-+    }
-+
-+    private fun completeIfFinished() {
-+        val snapshot = _state.value
-+        if (!snapshot.sweeping) return
-+        val stillRunning = snapshot.hosts.values.any {
-+            it.status == SourceHealthStatus.CHECKING || it.status == SourceHealthStatus.UNKNOWN
-+        }
-+        if (stillRunning) return
-+
-+        val finishedDailySweep = dailySweepActive
-+        dailySweepActive = false
-+        _state.update {
-+            it.copy(sweeping = false, completed = it.total, total = maxOf(it.total, it.hosts.size))
-+        }
-+        persist()
-+        // One "testing done" toast per calendar day, whichever sweep finished
-+        // first (the launch sweep, or the first source list of the day). It is
-+        // debounced so addon groups that arrive a moment later stay included.
-+        if (lastToastedDay != snapshot.day) {
-+            toastJob?.cancel()
-+            toastJob = scope.launch {
-+                delay(3_000L)
-+                val current = _state.value
-+                if (current.isRunning) return@launch
-+                if (lastToastedDay == current.day) return@launch
-+                lastToastedDay = current.day
-+                NuvioToastController.show(SourceHealthTexts.testingDone, durationMillis = 2_400L)
-+            }
-+        }
-+        if (finishedDailySweep) {
-+            log.d { "Daily source sweep finished for ${snapshot.day}" }
-+        }
-+    }
-+
-+    /** True when the source may be listed (online, untested or not probe-able). */
-+    fun isSourcePassing(stream: StreamItem): Boolean {
-+        val host = stream.sourceHealthHost() ?: return true
-+        return _state.value.entryFor(host).status != SourceHealthStatus.OFFLINE
-+    }
-+
-+    /** True while this source is queued or in flight. */
-+    fun isSourceTesting(stream: StreamItem): Boolean {
-+        val host = stream.sourceHealthHost() ?: return false
-+        return when (_state.value.entryFor(host).status) {
-+            SourceHealthStatus.CHECKING, SourceHealthStatus.UNKNOWN -> true
-+            else -> false
-+        }
-+    }
-+
-+    fun latencyFor(host: String?): Long? = host?.let { _state.value.entryFor(it).latencyMs }
-+
-+    private suspend fun probe(url: String): SourceHealthEntry {
-+        val mark = TimeSource.Monotonic.markNow()
-+        val response = withTimeoutOrNull(probeTimeoutMs) {
-+            runCatching {
-+                httpRequestRaw(
-+                    method = "GET",
-+                    url = url,
-+                    headers = mapOf("Range" to "bytes=0-0"),
-+                    body = "",
-+                    maxResponseBodyBytes = 2_048,
-+                )
-+            }.getOrNull()
-+        }
-+        val elapsed = mark.elapsedNow().inWholeMilliseconds
-+        return when {
-+            response == null -> SourceHealthEntry(status = SourceHealthStatus.OFFLINE)
-+            response.status in 200..399 -> SourceHealthEntry(
-+                status = SourceHealthStatus.ONLINE,
-+                latencyMs = elapsed,
-+            )
-+            else -> SourceHealthEntry(status = SourceHealthStatus.OFFLINE)
-+        }
-+    }
-+
-+    private fun persist() {
-+        val snapshot = _state.value
-+        if (snapshot.hosts.isEmpty()) return
-+        val samples = sampleUrls.value
-+        val payload = buildString {
-+            append("d=")
-+            append(snapshot.day)
-+            append('\n')
-+            snapshot.hosts.forEach { (host, entry) ->
-+                append(host)
-+                append('\t')
-+                append(entry.status.name)
-+                append('\t')
-+                append(entry.latencyMs?.toString().orEmpty())
-+                append('\t')
-+                append(samples[host].orEmpty())
-+                append('\n')
-+            }
-+        }
-+        runCatching { SourceHealthStorage.savePayload(payload) }
-+    }
-+
-+    private data class PersistedHealth(
-+        val day: String,
-+        val hosts: Map<String, SourceHealthEntry>,
-+        val sampleUrls: Map<String, String>,
-+    )
-+
-+    private fun parsePersisted(payload: String?): PersistedHealth {
-+        if (payload.isNullOrBlank()) return PersistedHealth("", emptyMap(), emptyMap())
-+        var day = ""
-+        val hosts = mutableMapOf<String, SourceHealthEntry>()
-+        val samples = mutableMapOf<String, String>()
-+        payload.lineSequence().forEach { line ->
-+            if (line.isBlank()) return@forEach
-+            if (line.startsWith("d=")) {
-+                day = line.removePrefix("d=").trim()
-+                return@forEach
-+            }
-+            val parts = line.split('\t')
-+            if (parts.size < 2) return@forEach
-+            val host = parts[0].trim()
-+            if (host.isEmpty()) return@forEach
-+            val status = runCatching { SourceHealthStatus.valueOf(parts[1].trim()) }
-+                .getOrElse { SourceHealthStatus.UNKNOWN }
-+            val latency = parts.getOrNull(2)?.trim()?.takeIf { it.isNotEmpty() }?.toLongOrNull()
-+            val sample = parts.getOrNull(3)?.trim()?.takeIf { it.isNotEmpty() }
-+            hosts[host] = SourceHealthEntry(status = status, latencyMs = latency)
-+            if (sample != null) samples[host] = sample
-+        }
-+        return PersistedHealth(day = day, hosts = hosts, sampleUrls = samples)
-+    }
-+}
-+
-+/** Strings used by the source health sweep. */
-+internal object SourceHealthTexts {
-+    const val testingDone: String = "Testing done"
-+}
-diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.kt
-new file mode 100644
-index 0000000..f7409c2
---- /dev/null
-+++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.kt
-@@ -0,0 +1,6 @@
-+package com.nuvio.app.features.streams
-+
-+internal expect object SourceHealthStorage {
-+    fun loadPayload(): String?
-+    fun savePayload(payload: String)
-+}
-diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamCard.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamCard.kt
-index 5dffa35..66531d4 100644
---- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamCard.kt
-+++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamCard.kt
-@@ -67,6 +67,8 @@ internal fun StreamCard(
-     isCurrent: Boolean = false,
-     currentLabel: String? = null,
-     outlined: Boolean = false,
-+    isTesting: Boolean = false,
-+    latencyMs: Long? = null,
- ) {
-     val partyLabel = if (isCurrent) null else LocalStreamHighlight.current(stream)
-     val cardShape = RoundedCornerShape(12.dp)
-@@ -163,6 +165,11 @@ internal fun StreamCard(
-             }
-         }
- 
-+        if (isTesting || latencyMs != null) {
-+            Spacer(modifier = Modifier.width(10.dp))
-+            SourceHealthBadge(isTesting = isTesting, latencyMs = latencyMs)
-+        }
-+
-         if (showAddonLogo) {
-             Spacer(modifier = Modifier.width(12.dp))
-             Column(
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
 old mode 100644
 new mode 100755
-index 28bee25..12782ec
+index 28bee25..c4cf7fe
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
 @@ -134,6 +134,32 @@ data class StreamItem(
@@ -1170,17 +724,16 @@ index 28bee25..12782ec
  }
  
  @Serializable
-@@ -318,6 +344,9 @@ data class StreamsUiState(
+@@ -318,6 +344,8 @@ data class StreamsUiState(
      val groups: List<AddonStreamGroup> = emptyList(),
      val activeAddonIds: Set<String> = emptySet(),
      val selectedFilter: String? = null,
 +    val qualityFilters: Set<StreamQualityFilter> = StreamSourceFilterPrefs.selectedQualities(),
 +    val languageFilters: Set<String> = StreamSourceFilterPrefs.state.value.languages,
-+    val sourceHealth: SourceHealthSnapshot = SourceHealthRepository.state.value,
      val isAnyLoading: Boolean = false,
      val emptyStateReason: StreamsEmptyStateReason? = null,
      val autoPlayStream: StreamItem? = null,
-@@ -327,8 +356,40 @@ data class StreamsUiState(
+@@ -327,8 +355,21 @@ data class StreamsUiState(
      val overlayMessage: String? = null,
  ) {
      val filteredGroups: List<AddonStreamGroup>
@@ -1190,36 +743,17 @@ index 28bee25..12782ec
 +            val base = if (selectedFilter == null) groups
 +            else groups.filter { it.addonId == selectedFilter }
 +            // Multi-select filters: OR inside the quality group, OR inside the
-+            // language group, AND across the two groups. Sources that failed the
-+            // daily health sweep are dropped here, so every list in the app
-+            // (phone, tablet and in-player) shows the same passing servers.
++            // language group, AND across the two groups.
 +            return base
 +                .map { group ->
 +                    group.copy(
 +                        streams = group.streams.filter { stream ->
-+                            stream.matchesSourceFilters(qualityFilters, languageFilters) &&
-+                                sourceHealth.isStreamVisible(stream)
++                            stream.matchesSourceFilters(qualityFilters, languageFilters)
 +                        },
 +                    )
 +                }
 +                .filter { it.streams.isNotEmpty() || it.isLoading }
 +        }
-+
-+    /** Best "balanced" sources among the passing, filtered ones. */
-+    val bestSources: List<StreamItem>
-+        get() = allStreams
-+            .filter { stream ->
-+                stream.sourceHealthHost()?.let { host ->
-+                    sourceHealth.entryFor(host).status == SourceHealthStatus.ONLINE
-+                } ?: false
-+            }
-+            .sortedByDescending { stream ->
-+                stream.bestSourceScore(stream.sourceHealthHost()?.let { sourceHealth.entryFor(it).latencyMs })
-+            }
-+            .take(3)
-+
-+    val isTestingSources: Boolean
-+        get() = sourceHealth.isRunning
  
      val allStreams: List<StreamItem>
          get() = filteredGroups.flatMap { it.streams }
@@ -1237,10 +771,10 @@ index 0000000..f813ea2
 +}
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt
 new file mode 100644
-index 0000000..0e357c8
+index 0000000..3196139
 --- /dev/null
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,497 @@
 +package com.nuvio.app.features.streams
 +
 +import androidx.compose.animation.animateColorAsState
@@ -1291,15 +825,6 @@ index 0000000..0e357c8
 +    FHD("1080p"),
 +    HD("720p"),
 +    SD("SD");
-+
-+    /** Rough "how good is this" weight used by the balanced best-source rank. */
-+    val qualityWeight: Float
-+        get() = when (this) {
-+            ULTRA -> 1f
-+            FHD -> 0.85f
-+            HD -> 0.68f
-+            SD -> 0.42f
-+        }
 +
 +    companion object {
 +        val DISPLAY_ORDER: List<StreamQualityFilter> = listOf(ULTRA, FHD, HD, SD)
@@ -1747,272 +1272,13 @@ index 0000000..0e357c8
 +        }
 +    }
 +}
-+
-+/**
-+ * Balanced ranking used by the "Best available" strip: good quality with a
-+ * quick streaming start. Latency dominates only when the gap is large, so a
-+ * healthy 1080p source still beats a slow 4K one.
-+ */
-+internal fun StreamItem.bestSourceScore(latencyMs: Long?): Float {
-+    val bestQuality = sourceFilterQualities.maxOfOrNull { it.qualityWeight } ?: 0.5f
-+    val latencyScore = latencyMs?.let { latency ->
-+        1f - (latency.coerceIn(0L, 4_000L).toFloat() / 4_000f)
-+    } ?: 0.55f
-+    return (bestQuality * 0.6f) + (latencyScore * 0.4f)
-+}
-diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceHealthUi.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceHealthUi.kt
-new file mode 100644
-index 0000000..d070e94
---- /dev/null
-+++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceHealthUi.kt
-@@ -0,0 +1,240 @@
-+package com.nuvio.app.features.streams
-+
-+import androidx.compose.animation.animateColorAsState
-+import androidx.compose.animation.core.RepeatMode
-+import androidx.compose.animation.core.animateFloat
-+import androidx.compose.animation.core.infiniteRepeatable
-+import androidx.compose.animation.core.rememberInfiniteTransition
-+import androidx.compose.animation.core.tween
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.border
-+import androidx.compose.foundation.clickable
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
-+import androidx.compose.foundation.layout.Column
-+import androidx.compose.foundation.layout.Row
-+import androidx.compose.foundation.layout.Spacer
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.height
-+import androidx.compose.foundation.layout.padding
-+import androidx.compose.foundation.layout.size
-+import androidx.compose.foundation.layout.width
-+import androidx.compose.foundation.shape.RoundedCornerShape
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.Text
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.getValue
-+import androidx.compose.ui.Alignment
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.draw.alpha
-+import androidx.compose.ui.draw.clip
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.text.style.TextOverflow
-+import androidx.compose.ui.unit.dp
-+import androidx.compose.ui.unit.sp
-+import com.nuvio.app.core.ui.NuvioTokens
-+import com.nuvio.app.core.ui.nuvio
-+
-+/** Small "Testing" / latency pill shown on a source row. */
-+@Composable
-+internal fun SourceHealthBadge(
-+    isTesting: Boolean,
-+    latencyMs: Long?,
-+    modifier: Modifier = Modifier,
-+) {
-+    val tokens = MaterialTheme.nuvio.colors
-+    val transition = rememberInfiniteTransition(label = "source_health_pulse")
-+    val pulse by transition.animateFloat(
-+        initialValue = 0.35f,
-+        targetValue = 1f,
-+        animationSpec = infiniteRepeatable(
-+            animation = tween(durationMillis = 850),
-+            repeatMode = RepeatMode.Reverse,
-+        ),
-+        label = "source_health_pulse_alpha",
-+    )
-+    val label = when {
-+        isTesting -> "Testing"
-+        latencyMs != null -> formatSourceLatency(latencyMs)
-+        else -> null
-+    } ?: return
-+
-+    val container by animateColorAsState(
-+        targetValue = if (isTesting) tokens.surfaceElevated.copy(alpha = 0.9f) else tokens.accent.copy(alpha = 0.14f),
-+        animationSpec = tween(durationMillis = 180),
-+        label = "source_health_container",
-+    )
-+    val content = if (isTesting) tokens.textMuted else tokens.accent
-+
-+    Row(
-+        modifier = modifier
-+            .clip(RoundedCornerShape(NuvioTokens.Radius.full))
-+            .background(container)
-+            .border(
-+                width = 1.dp,
-+                color = if (isTesting) tokens.borderDefault else tokens.borderSelected.copy(alpha = 0.5f),
-+                shape = RoundedCornerShape(NuvioTokens.Radius.full),
-+            )
-+            .padding(horizontal = NuvioTokens.Space.s8, vertical = NuvioTokens.Space.s4),
-+        verticalAlignment = Alignment.CenterVertically,
-+        horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s5),
-+    ) {
-+        Box(
-+            modifier = Modifier
-+                .size(6.dp)
-+                .alpha(if (isTesting) pulse else 1f)
-+                .clip(RoundedCornerShape(NuvioTokens.Radius.full))
-+                .background(content),
-+        )
-+        Text(
-+            text = label,
-+            style = MaterialTheme.typography.labelSmall.copy(
-+                fontSize = 11.sp,
-+                fontWeight = FontWeight.SemiBold,
-+            ),
-+            color = content,
-+            maxLines = 1,
-+        )
-+    }
-+}
-+
-+internal fun formatSourceLatency(latencyMs: Long): String =
-+    if (latencyMs < 1_000L) "${latencyMs}ms" else "${(latencyMs / 100L) / 10f}s"
-+
-+/**
-+ * Nuvio-styled "Best available" strip. Lists the fastest, good-quality sources
-+ * that survived the health sweep and the active language/quality filters, using
-+ * a balanced score (quality weight + measured response time).
-+ */
-+@Composable
-+internal fun StreamBestSourcesSection(
-+    sources: List<StreamItem>,
-+    health: SourceHealthSnapshot,
-+    onStreamSelected: (StreamItem) -> Unit,
-+    modifier: Modifier = Modifier,
-+) {
-+    if (sources.isEmpty()) return
-+    val tokens = MaterialTheme.nuvio.colors
-+    Column(
-+        modifier = modifier
-+            .fillMaxWidth()
-+            .clip(RoundedCornerShape(NuvioTokens.Radius.lg))
-+            .background(tokens.surfaceElevated.copy(alpha = 0.6f))
-+            .border(
-+                width = 1.dp,
-+                color = tokens.borderDefault,
-+                shape = RoundedCornerShape(NuvioTokens.Radius.lg),
-+            )
-+            .padding(NuvioTokens.Space.s12),
-+        verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s8),
-+    ) {
-+        Row(
-+            verticalAlignment = Alignment.CenterVertically,
-+            horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s8),
-+        ) {
-+            Box(
-+                modifier = Modifier
-+                    .size(8.dp)
-+                    .clip(RoundedCornerShape(NuvioTokens.Radius.full))
-+                    .background(tokens.accent),
-+            )
-+            Column {
-+                Text(
-+                    text = "Best available",
-+                    style = MaterialTheme.typography.titleSmall.copy(
-+                        fontSize = 14.sp,
-+                        fontWeight = FontWeight.Bold,
-+                    ),
-+                    color = tokens.textPrimary,
-+                )
-+                Text(
-+                    text = if (health.isRunning) "Fastest passing sources · still testing" else "Balanced quality and fast start",
-+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-+                    color = tokens.textMuted,
-+                )
-+            }
-+        }
-+        sources.forEachIndexed { index, stream ->
-+            BestSourceRow(
-+                rank = index + 1,
-+                stream = stream,
-+                latencyMs = stream.sourceHealthHost()?.let { health.entryFor(it).latencyMs },
-+                onClick = { onStreamSelected(stream) },
-+            )
-+        }
-+    }
-+}
-+
-+@Composable
-+private fun BestSourceRow(
-+    rank: Int,
-+    stream: StreamItem,
-+    latencyMs: Long?,
-+    onClick: () -> Unit,
-+) {
-+    val tokens = MaterialTheme.nuvio.colors
-+    val quality = StreamQualityFilter.DISPLAY_ORDER.firstOrNull { it in stream.sourceFilterQualities }
-+    Row(
-+        modifier = Modifier
-+            .fillMaxWidth()
-+            .clip(RoundedCornerShape(NuvioTokens.Radius.md))
-+            .background(tokens.overlayHover)
-+            .clickable(onClick = onClick)
-+            .padding(horizontal = NuvioTokens.Space.s10, vertical = NuvioTokens.Space.s8),
-+        verticalAlignment = Alignment.CenterVertically,
-+        horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s10),
-+    ) {
-+        Box(
-+            modifier = Modifier
-+                .size(22.dp)
-+                .clip(RoundedCornerShape(NuvioTokens.Radius.full))
-+                .background(tokens.accent.copy(alpha = 0.18f)),
-+            contentAlignment = Alignment.Center,
-+        ) {
-+            Text(
-+                text = rank.toString(),
-+                style = MaterialTheme.typography.labelSmall.copy(
-+                    fontSize = 11.sp,
-+                    fontWeight = FontWeight.Bold,
-+                ),
-+                color = tokens.accent,
-+            )
-+        }
-+        Text(
-+            text = stream.displayName(),
-+            style = MaterialTheme.typography.bodySmall.copy(
-+                fontSize = 13.sp,
-+                fontWeight = FontWeight.Medium,
-+            ),
-+            color = tokens.textPrimary,
-+            maxLines = 1,
-+            overflow = TextOverflow.Ellipsis,
-+            modifier = Modifier.weight(1f),
-+        )
-+        if (quality != null) {
-+            Text(
-+                text = quality.label,
-+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
-+                color = tokens.textSecondary,
-+                modifier = Modifier
-+                    .clip(RoundedCornerShape(NuvioTokens.Radius.sm))
-+                    .background(tokens.overlaySelected)
-+                    .padding(horizontal = NuvioTokens.Space.s6, vertical = NuvioTokens.Space.s2),
-+            )
-+        }
-+        if (latencyMs != null) {
-+            Spacer(modifier = Modifier.width(NuvioTokens.Space.s2))
-+            Text(
-+                text = formatSourceLatency(latencyMs),
-+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
-+                color = tokens.success,
-+            )
-+        }
-+    }
-+}
-+
-+private fun StreamItem.displayName(): String =
-+    name?.takeIf { it.isNotBlank() }
-+        ?: title?.takeIf { it.isNotBlank() }
-+        ?: sourceName?.takeIf { it.isNotBlank() }
-+        ?: addonName
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
 old mode 100644
 new mode 100755
-index 58fd52c..169538c
+index 58fd52c..08073fd
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
-@@ -33,9 +33,22 @@ import kotlinx.coroutines.launch
+@@ -33,7 +33,10 @@ import kotlinx.coroutines.launch
  object StreamsRepository {
      private val log = Logger.withTag("StreamsRepo")
      private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -2023,20 +1289,8 @@ index 58fd52c..169538c
 +    private val _uiState = MutableStateFlow(seedStreamFilters())
      val uiState: StateFlow<StreamsUiState> = _uiState.asStateFlow()
  
-+    init {
-+        // Mirror the background health sweep into the list state so that
-+        // fail-off sources disappear and passing ones light up as they finish.
-+        scope.launch {
-+            SourceHealthRepository.state.collect { snapshot ->
-+                _uiState.update { current -> current.copy(sourceHealth = snapshot) }
-+            }
-+        }
-+    }
-+
      private var activeJob: Job? = null
-     private var activeRequestKey: String? = null
- 
-@@ -647,6 +660,28 @@ object StreamsRepository {
+@@ -647,6 +650,28 @@ object StreamsRepository {
          _uiState.update { it.copy(selectedFilter = addonId) }
      }
  
@@ -2068,7 +1322,7 @@ index 58fd52c..169538c
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
 old mode 100644
 new mode 100755
-index c003a58..9495dac
+index c003a58..56ec937
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
 @@ -497,6 +497,16 @@ private fun MobileStreamsLayout(
@@ -2088,67 +1342,14 @@ index c003a58..9495dac
                      StreamList(
                          uiState = uiState,
                          debridEnabled = debridEnabled,
-@@ -738,6 +748,13 @@ internal fun StreamList(
+@@ -738,6 +748,7 @@ internal fun StreamList(
      val hasGroups = filteredGroups.isNotEmpty()
      val hasAnyStreams = filteredGroups.any { it.streams.isNotEmpty() }
      val anyLoading = filteredGroups.any { it.isLoading }
 +
-+    // Kick off (or reuse) today's background health sweep for every source that
-+    // is now on screen. The state flows back through StreamsUiState, so passed
-+    // servers appear progressively and failed ones quietly drop out.
-+    LaunchedEffect(uiState.groups) {
-+        SourceHealthRepository.registerStreams(uiState.groups.flatMap { group -> group.streams })
-+    }
      val torrentNotSupportedText = stringResource(Res.string.streams_torrent_not_supported)
      val fetchingText = stringResource(Res.string.streams_fetching)
      val findingStreamsText = stringResource(Res.string.streams_finding_streams)
-@@ -794,6 +811,21 @@ internal fun StreamList(
-             }
- 
-             else -> {
-+                val bestSources = uiState.bestSources
-+                if (bestSources.isNotEmpty()) {
-+                    item(key = "best_sources") {
-+                        StreamBestSourcesSection(
-+                            sources = bestSources,
-+                            health = uiState.sourceHealth,
-+                            onStreamSelected = { stream ->
-+                                if (stream.isSelectableForPlayback(debridEnabled)) {
-+                                    onStreamSelected(stream, resumePositionMs, resumeProgressFraction)
-+                                }
-+                            },
-+                            modifier = Modifier.padding(bottom = 12.dp),
-+                        )
-+                    }
-+                }
-                 filteredGroups.forEachIndexed { groupIndex, group ->
-                     streamSection(
-                         sectionKey = streamSectionRenderKey(groupIndex = groupIndex, group = group),
-@@ -806,6 +838,7 @@ internal fun StreamList(
-                         badgePlacement = streamBadgeSettings.badgePlacement,
-                         torrentNotSupportedText = torrentNotSupportedText,
-                         fetchingText = fetchingText,
-+                        sourceHealth = uiState.sourceHealth,
-                         onStreamSelected = onStreamSelected,
-                         onStreamLongPress = onStreamLongPress,
-                         resumePositionMs = resumePositionMs,
-@@ -837,6 +870,7 @@ private fun LazyListScope.streamSection(
-     badgePlacement: StreamBadgePlacement,
-     torrentNotSupportedText: String,
-     fetchingText: String,
-+    sourceHealth: SourceHealthSnapshot,
-     onStreamSelected: (stream: StreamItem, resumePositionMs: Long?, resumeProgressFraction: Float?) -> Unit,
-     onStreamLongPress: (StreamItem) -> Unit,
-     resumePositionMs: Long?,
-@@ -891,6 +925,8 @@ private fun LazyListScope.streamSection(
-                 showFileSizeBadges = showFileSizeBadges,
-                 showAddonLogo = showAddonLogo,
-                 badgePlacement = badgePlacement,
-+                isTesting = sourceHealth.isStreamTesting(stream),
-+                latencyMs = stream.sourceHealthHost()?.let { host -> sourceHealth.entryFor(host).latencyMs },
-                 onClick = {
-                     if (isSelectable) {
-                         onStreamSelected(stream, resumePositionMs, resumeProgressFraction)
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
 old mode 100644
 new mode 100755
@@ -2172,26 +1373,6 @@ index 956cdbf..465b456
                          ActiveScrapersStatusBlock(
                              groups = uiState.groups,
                              modifier = Modifier.padding(bottom = 4.dp),
-diff --git a/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt
-new file mode 100644
-index 0000000..538cf70
---- /dev/null
-+++ b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt
-@@ -0,0 +1,14 @@
-+package com.nuvio.app.features.streams
-+
-+import platform.Foundation.NSUserDefaults
-+
-+internal actual object SourceHealthStorage {
-+    private const val payloadKey = "stream_source_health_payload"
-+
-+    actual fun loadPayload(): String? =
-+        NSUserDefaults.standardUserDefaults.stringForKey(payloadKey)
-+
-+    actual fun savePayload(payload: String) {
-+        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = payloadKey)
-+    }
-+}
 diff --git a/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt
 new file mode 100644
 index 0000000..1f28f57
