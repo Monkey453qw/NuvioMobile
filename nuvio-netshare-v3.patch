@@ -1,0 +1,2218 @@
+diff --git a/composeApp/build.gradle.kts b/composeApp/build.gradle.kts
+index 69d1e2f..28feb76 100644
+--- a/composeApp/build.gradle.kts
++++ b/composeApp/build.gradle.kts
+@@ -447,6 +447,9 @@ kotlin {
+                 implementation(libs.coil.gif)
+                 implementation("androidx.recyclerview:recyclerview:1.4.0")
+                 implementation("com.squareup.okhttp3:okhttp:4.12.0")
++                // DoH fallback for ResilientDns — direct connections survive
++                // networks with no working local DNS (proxy-only hotspots).
++                implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
+                 implementation("com.google.code.gson:gson:2.11.0")
+                 // libass - atlas-based subtitle rendering (from NuvioMedia/nuvio-libass)
+                 implementation(files("libs/nuvio-libass-release.aar"))
+diff --git a/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt b/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
+index c1b3aa9..d202f84 100644
+--- a/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
++++ b/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
+@@ -1,7 +1,7 @@
+ package com.nuvio.app.features.trailer
+ 
+ import android.net.Uri
+-import com.nuvio.app.core.network.IPv4FirstDns
++import com.nuvio.app.core.network.ResilientDns
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+@@ -24,7 +24,7 @@ internal object TrailerExtractionPlatform {
+     )
+ 
+     private val httpClient = OkHttpClient.Builder()
+-        .dns(IPv4FirstDns())
++        .dns(ResilientDns())
+         .connectTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+         .readTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+         .writeTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+@@ -33,7 +33,7 @@ internal object TrailerExtractionPlatform {
+         .build()
+ 
+     private val probeClient = OkHttpClient.Builder()
+-        .dns(IPv4FirstDns())
++        .dns(ResilientDns())
+         .connectTimeout(2, TimeUnit.SECONDS)
+         .readTimeout(2, TimeUnit.SECONDS)
+         .followRedirects(true)
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
+old mode 100644
+new mode 100755
+index eee68bd..8945b28
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
+@@ -62,6 +62,9 @@ import com.nuvio.app.features.simkl.SimklSyncStorage
+ import com.nuvio.app.features.tmdb.TmdbSettingsStorage
+ import com.nuvio.app.features.updater.AndroidAppUpdaterPlatform
+ import com.nuvio.app.core.ui.CardDepthStyleStorage
++import com.nuvio.app.features.streams.StreamSourceFilterStorage
++import com.nuvio.app.features.streams.SourceHealthRepository
++import com.nuvio.app.features.streams.SourceHealthStorage
+ import com.nuvio.app.core.ui.PosterCardStyleStorage
+ import com.nuvio.app.core.poster.CustomPosterUrlStorage
+ import com.nuvio.app.features.watched.WatchedStorage
+@@ -117,6 +120,8 @@ open class MainActivity : AppCompatActivity() {
+         PosterCardStyleStorage.initialize(applicationContext)
+         CustomPosterUrlStorage.initialize(applicationContext)
+         CardDepthStyleStorage.initialize(applicationContext)
++        StreamSourceFilterStorage.initialize(applicationContext)
++        SourceHealthStorage.initialize(applicationContext)
+         DebridSettingsStorage.initialize(applicationContext)
+         TmdbSettingsStorage.initialize(applicationContext)
+         MdbListSettingsStorage.initialize(applicationContext)
+@@ -148,6 +153,7 @@ open class MainActivity : AppCompatActivity() {
+         PlatformLocalAccountDataCleaner.initialize(applicationContext)
+         EpisodeReleaseNotificationPlatform.initialize(applicationContext)
+         EpisodeReleaseNotificationPlatform.bindActivity(this)
++        SourceHealthRepository.bootstrap()
+         handleIncomingAppIntent(intent)
+ 
+         setContent {
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt
+new file mode 100644
+index 0000000..f62e12c
+--- /dev/null
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt
+@@ -0,0 +1,56 @@
++package com.nuvio.app.core.network
++
++import okhttp3.Dns
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.OkHttpClient
++import okhttp3.dnsoverhttps.DnsOverHttps
++import java.net.InetAddress
++import java.util.concurrent.TimeUnit
++
++/**
++ * IPv4-first DNS with a DNS-over-HTTPS fallback.
++ *
++ * OkHttp only consults [Dns] for DIRECT connections — requests selected for the
++ * system HTTP proxy skip DNS entirely. So on a proxy-only hotspot this class is
++ * normally never hit. When a connection does go direct and the network's local
++ * DNS is dead (NetShare hotspots, where Android Private DNS / DoT:853 cannot
++ * run), the system lookup would previously block for many seconds and fail.
++ * Falling back to DoH resolvers addressed by IP literal keeps those direct
++ * connections working with zero local DNS. On healthy networks nothing changes:
++ * the system lookup succeeds on the first try.
++ */
++class ResilientDns : Dns {
++
++    private val delegate = IPv4FirstDns()
++
++    private val dohFallback: List<Dns> by lazy {
++        val bootstrap = OkHttpClient.Builder()
++            .connectTimeout(4, TimeUnit.SECONDS)
++            .readTimeout(4, TimeUnit.SECONDS)
++            .callTimeout(6, TimeUnit.SECONDS)
++            .build()
++        listOf("1.1.1.1", "8.8.8.8").map { resolverIp ->
++            DnsOverHttps.Builder()
++                .client(bootstrap)
++                // IP-literal URL: no bootstrap DNS needed, and both resolvers ship
++                // TLS certificates valid for their bare IPs.
++                .url("https://$resolverIp/dns-query".toHttpUrl())
++                .build()
++        }
++    }
++
++    override fun lookup(hostname: String): List<InetAddress> {
++        try {
++            return delegate.lookup(hostname)
++        } catch (systemFailure: Exception) {
++            dohFallback.forEach { resolver ->
++                try {
++                    return resolver.lookup(hostname)
++                } catch (_: Exception) {
++                    // try the next resolver
++                }
++            }
++            throw systemFailure
++        }
++    }
++}
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt
+new file mode 100644
+index 0000000..ef1d710
+--- /dev/null
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt
+@@ -0,0 +1,86 @@
++package com.nuvio.app.core.network
++
++import android.content.Context
++import android.net.ConnectivityManager
++import android.os.Build
++import android.util.Log
++import java.net.URI
++
++/**
++ * Read-only access to the Android system HTTP proxy (the "Manual proxy" set in
++ * the Wi-Fi network options).
++ *
++ * Why this matters: on NetShare-style no-root "proxy hotspots" the Wi-Fi network
++ * exposes a working HTTP CONNECT proxy but has NO working DNS (and Android
++ * Private DNS / DoT:853 cannot run over it either). OkHttp — the whole app API,
++ * images, addons, ExoPlayer playback — automatically honors that proxy and
++ * needs zero local DNS. libmpv does not: it resolves hostnames itself and
++ * opens raw sockets, which blocks forever on such a network. Feeding mpv the
++ * same system proxy through its `http-proxy` property makes playback work
++ * with zero local DNS, exactly like every other request in the app.
++ */
++object SystemProxy {
++
++    private const val TAG = "SystemProxy"
++
++    private val IPV4_REGEX = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""")
++
++    /** host + port of the default network's HTTP proxy, or null when none is set. */
++    fun defaultProxy(context: Context): Pair<String, Int>? {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
++        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
++            ?: return null
++        val info = runCatching { cm.defaultProxy }.getOrNull() ?: return null
++        val host = info.host?.trim().orEmpty()
++        val port = info.port
++        if (host.isEmpty() || port <= 0) return null
++        // A hostname proxy would itself need DNS to be reachable — exactly what is
++        // broken on a proxy-only hotspot. NetShare always shows an IP literal.
++        if (!isIpLiteral(host)) {
++            Log.w(TAG, "System proxy host '$host' is not an IP literal; ignoring for mpv")
++            return null
++        }
++        return host to port
++    }
++
++    /**
++     * The `http-proxy` value to give libmpv for [url], or null when the URL must
++     * (or can safely) be fetched directly: non-HTTP schemes, loopback targets,
++     * and LAN/private targets (Jellyfin/Emby servers) stay direct so local
++     * playback keeps working, with or without a proxy.
++     */
++    fun mpvProxyForUrl(context: Context, url: String): String? {
++        val scheme = url.substringBefore(':', "").lowercase()
++        if (scheme != "http" && scheme != "https") return null
++        // URI.getHost() keeps brackets on IPv6 literals ("[::1]").
++        val host = runCatching { URI(url).host?.lowercase() }.getOrNull().orEmpty()
++        if (host.isEmpty()) return null
++        if (host == "localhost" || host == "::1" || host == "[::1]" || host == "127.0.0.1") return null
++        val proxy = defaultProxy(context) ?: return null
++        if (isPrivateTarget(host)) return null
++        return "http://${proxy.first}:${proxy.second}"
++    }
++
++    /** True when the host is a loopback or private/LAN address literal. */
++    private fun isPrivateTarget(host: String): Boolean {
++        if (!isIpLiteral(host)) {
++            // mDNS / local suffixes resolve via multicast, not DNS — keep direct.
++            return host.endsWith(".local") || host.endsWith(".lan")
++        }
++        val parts = host.split('.')
++        if (parts.size != 4) return false // IPv6 literal — public in practice
++        val octets = parts.map { it.toInt() }
++        return when {
++            octets[0] == 10 -> true
++            octets[0] == 172 && octets[1] in 16..31 -> true
++            octets[0] == 192 && octets[1] == 168 -> true
++            octets[0] == 169 && octets[1] == 254 -> true
++            else -> false
++        }
++    }
++
++    private fun isIpLiteral(host: String): Boolean {
++        val match = IPV4_REGEX.matchEntire(host) ?: return host.contains(':')
++        return match.groupValues.drop(1).all { it.toInt() in 0..255 }
++    }
++}
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
+index 29d28f4..2ea542c 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
+@@ -3,7 +3,7 @@ package com.nuvio.app.features.addons
+ import android.content.Context
+ import android.content.SharedPreferences
+ import com.nuvio.app.core.diagnostics.SentryNetworkBreadcrumbInterceptor
+-import com.nuvio.app.core.network.IPv4FirstDns
++import com.nuvio.app.core.network.ResilientDns
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+@@ -20,7 +20,6 @@ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import okhttp3.RequestBody.Companion.toRequestBody
+-import java.net.Proxy
+ import java.io.ByteArrayOutputStream
+ import java.io.File
+ import java.io.InputStream
+@@ -102,14 +101,20 @@ internal object AddonHttpClientProvider {
+ 
+ private fun buildAddonHttpClient(cache: Cache? = null): OkHttpClient =
+     OkHttpClient.Builder()
+-        .dns(IPv4FirstDns())
++        // ResilientDns: direct lookups fall back to DoH when the network has no
++        // working DNS (NetShare-style proxy-only hotspots).
++        .dns(ResilientDns())
+         .connectTimeout(60, TimeUnit.SECONDS)
+         .readTimeout(60, TimeUnit.SECONDS)
+         .writeTimeout(60, TimeUnit.SECONDS)
+         .followRedirects(true)
+         .followSslRedirects(true)
+         .addInterceptor(SentryNetworkBreadcrumbInterceptor())
+-        .proxy(Proxy.NO_PROXY)
++        // NO_PROXY removed: it hard-bypassed the Android system HTTP proxy, so on
++        // NetShare-style proxy-only hotspots (no local DNS, Wi-Fi proxy as the only
++        // route out) every addon/plugin request froze. Without this line OkHttp
++        // uses the default ProxySelector — the system proxy when one is set, direct
++        // otherwise. Loopback targets are never proxied by Android's selector.
+         .apply {
+             if (cache != null) {
+                 cache(cache)
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
+index 9c2dd19..d6dcec2 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
+@@ -12,8 +12,13 @@ import kotlinx.coroutines.ensureActive
+ import okhttp3.Call
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
++import com.nuvio.app.core.network.ResilientDns
+ 
+ internal val downloadHttpClient = OkHttpClient.Builder()
++    // ResilientDns: proxied requests skip DNS entirely (OkHttp default), and
++    // direct lookups fall back to DoH when the network has no working DNS
++    // (NetShare-style proxy-only hotspots).
++    .dns(ResilientDns())
+     .connectTimeout(60, TimeUnit.SECONDS)
+     .readTimeout(60, TimeUnit.SECONDS)
+     .writeTimeout(60, TimeUnit.SECONDS)
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
+index 9ec8dd1..8f482be 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
+@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.viewinterop.AndroidView
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.lifecycle.Lifecycle
++import com.nuvio.app.core.network.SystemProxy
+ import com.nuvio.app.features.streams.redactedForLogs
+ import kotlinx.coroutines.runBlocking
+ import nuvio.composeapp.generated.resources.*
+@@ -1646,6 +1647,7 @@ private class NuvioLibmpvView(
+ 
+     private fun loadCurrentSourceNow(playWhenReady: Boolean) {
+         val sourceUrl = currentSourceUrl ?: return
++        applyMpvProxyNow(sourceUrl)
+         applyRequestHeadersNow(currentRequestHeaders)
+         setPausedNow(!playWhenReady)
+         mpv.setPropertyString("aid", "auto")
+@@ -1656,6 +1658,22 @@ private class NuvioLibmpvView(
+         setPausedNow(!playWhenReady)
+     }
+ 
++    /**
++     * NetShare-style proxy-only hotspots: libmpv ignores the Android system HTTP
++     * proxy and resolves DNS itself, which blocks forever on a network that has
++     * no working DNS (Android Private DNS / DoT cannot run there either). Hand
++     * mpv the same proxy every OkHttp request already uses, so playback works
++     * with zero local DNS. No-op on normal networks (no system proxy), and
++     * loopback/LAN targets stay direct — see SystemProxy.mpvProxyForUrl.
++     */
++    private fun applyMpvProxyNow(url: String) {
++        val proxy = runCatching { SystemProxy.mpvProxyForUrl(context, url) }.getOrNull()
++        mpv.setPropertyString("http-proxy", proxy ?: "")
++        if (proxy != null) {
++            Log.i("PlayerEngine", "libmpv using system HTTP proxy for stream")
++        }
++    }
++
+     fun attachStartupSubtitles() {
+         executeMpv {
+             currentExternalSubtitles.forEachIndexed { index, subtitle ->
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
+index 0323307..be87796 100644
+--- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
+@@ -5,7 +5,7 @@ import androidx.media3.datasource.DataSource
+ import androidx.media3.datasource.DefaultDataSource
+ import androidx.media3.datasource.okhttp.OkHttpDataSource
+ import com.nuvio.app.core.diagnostics.SentryNetworkBreadcrumbInterceptor
+-import com.nuvio.app.core.network.IPv4FirstDns
++import com.nuvio.app.core.network.ResilientDns
+ import okhttp3.OkHttpClient
+ import java.net.HttpURLConnection
+ import java.net.URL
+@@ -45,7 +45,10 @@ internal object PlayerPlaybackNetworking {
+ 
+     private val playbackHttpClient: OkHttpClient by lazy {
+         OkHttpClient.Builder()
+-            .dns(IPv4FirstDns())
++            // ResilientDns: proxied requests skip DNS entirely (OkHttp default),
++            // and direct lookups fall back to DoH when the network has no working
++            // DNS (NetShare-style proxy-only hotspots).
++            .dns(ResilientDns())
+             .sslSocketFactory(sslContext.socketFactory, trustAllManager)
+             .hostnameVerifier(playbackHostnameVerifier)
+             .connectTimeout(15, TimeUnit.SECONDS)
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt
+new file mode 100644
+index 0000000..a278058
+--- /dev/null
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt
+@@ -0,0 +1,26 @@
++package com.nuvio.app.features.streams
++
++import android.content.Context
++import android.content.SharedPreferences
++import com.nuvio.app.core.storage.ProfileScopedKey
++
++internal actual object SourceHealthStorage {
++    private const val preferencesName = "nuvio_stream_source_health"
++    private const val payloadKey = "stream_source_health_payload"
++
++    private var preferences: SharedPreferences? = null
++
++    fun initialize(context: Context) {
++        preferences = context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
++    }
++
++    actual fun loadPayload(): String? =
++        preferences?.getString(ProfileScopedKey.of(payloadKey), null)
++
++    actual fun savePayload(payload: String) {
++        preferences
++            ?.edit()
++            ?.putString(ProfileScopedKey.of(payloadKey), payload)
++            ?.apply()
++    }
++}
+diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt
+new file mode 100644
+index 0000000..08f6f35
+--- /dev/null
++++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt
+@@ -0,0 +1,26 @@
++package com.nuvio.app.features.streams
++
++import android.content.Context
++import android.content.SharedPreferences
++import com.nuvio.app.core.storage.ProfileScopedKey
++
++internal actual object StreamSourceFilterStorage {
++    private const val preferencesName = "nuvio_stream_source_filters"
++    private const val payloadKey = "stream_source_filters_payload"
++
++    private var preferences: SharedPreferences? = null
++
++    fun initialize(context: Context) {
++        preferences = context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
++    }
++
++    actual fun loadPayload(): String? =
++        preferences?.getString(ProfileScopedKey.of(payloadKey), null)
++
++    actual fun savePayload(payload: String) {
++        preferences
++            ?.edit()
++            ?.putString(ProfileScopedKey.of(payloadKey), payload)
++            ?.apply()
++    }
++}
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/MainTabsDestination.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/MainTabsDestination.kt
+index 1032903..4ed3ff5 100644
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/MainTabsDestination.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/MainTabsDestination.kt
+@@ -31,6 +31,7 @@ import com.nuvio.app.core.ui.FloatingNavigationBar
+ import com.nuvio.app.core.ui.FloatingNavigationItem
+ import com.nuvio.app.core.ui.PlatformBackHandler
+ import com.nuvio.app.core.ui.rememberNuvioNavBarScrollState
++import com.nuvio.app.core.ui.floatingNavigationBarPadding
+ import com.nuvio.app.features.profiles.NuvioProfile
+ import com.nuvio.app.features.profiles.ProfileSwitcherTab
+ import com.nuvio.app.features.settings.NavBarStyle
+@@ -68,6 +69,9 @@ internal fun MainTabsDestination(
+ 
+     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+         val isTabletLayout = useTabletFloatingTabBar || maxWidth >= 768.dp
++        // On tablets the floating bar sits on top in portrait, and moves to the
++        // bottom in landscape so it stays within thumb reach. Phones are untouched.
++        val isLandscapeTablet = isTabletLayout && maxWidth > maxHeight
+         val tabActions = remember(actions, isTabletLayout) { actions(isTabletLayout) }
+         val useNativeBottomTabs = if (useNativeNavigation) {
+             useNativeTabBar
+@@ -159,7 +163,7 @@ internal fun MainTabsDestination(
+         ) { innerPadding ->
+             Box(modifier = Modifier.fillMaxSize()) {
+                 CompositionLocalProvider(
+-                    LocalNuvioBottomNavigationOverlayPadding provides if (useNativeBottomTabs) 49.dp else if (!isTabletLayout && navBarStyleSetting != NavBarStyle.CLASSIC) 72.dp else 0.dp,
++                    LocalNuvioBottomNavigationOverlayPadding provides if (useNativeBottomTabs) 49.dp else if (isLandscapeTablet) 72.dp else if (!isTabletLayout && navBarStyleSetting != NavBarStyle.CLASSIC) 72.dp else 0.dp,
+                     LocalNuvioNavBarScrollState provides navBarScrollState,
+                 ) {
+                     AppTabHost(
+@@ -178,13 +182,21 @@ internal fun MainTabsDestination(
+                 if (isTabletLayout && !useNativeBottomTabs) {
+                     val tabletNavBarScrollState = remember { NuvioNavBarScrollState().apply { collapse() } }
+                     FloatingNavigationBar(
+-                        modifier = Modifier.align(Alignment.TopCenter).widthIn(max = 416.dp),
++                        modifier = if (isLandscapeTablet) {
++                            Modifier.align(Alignment.BottomCenter).widthIn(max = 416.dp)
++                        } else {
++                            Modifier.align(Alignment.TopCenter).widthIn(max = 416.dp)
++                        },
+                         scrollState = tabletNavBarScrollState,
+                         hazeState = navBarHazeState,
+-                        contentPadding = PaddingValues(
+-                            top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 10.dp,
+-                            bottom = 8.dp,
+-                        ),
++                        contentPadding = if (isLandscapeTablet) {
++                            floatingNavigationBarPadding()
++                        } else {
++                            PaddingValues(
++                                top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 10.dp,
++                                bottom = 8.dp,
++                            )
++                        },
+                         compactSize = true,
+                         items = floatingNavigationItems,
+                         glowEnabled = navBarGlowEnabled,
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
+old mode 100644
+new mode 100755
+index 3747d1e..57f80f5
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
+@@ -46,6 +46,7 @@ import com.nuvio.app.core.ui.NuvioTokens
+ import com.nuvio.app.core.ui.nuvio
+ import com.nuvio.app.features.details.MetaVideo
+ import com.nuvio.app.features.streams.StreamItem
++import com.nuvio.app.features.streams.StreamQualityLanguageFilterRow
+ import com.nuvio.app.features.streams.StreamsUiState
+ import com.nuvio.app.features.watchprogress.WatchProgressEntry
+ import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
+@@ -484,6 +485,16 @@ private fun EpisodeStreamsPanelContent(
+             onRefresh = onReload,
+         )
+ 
++        StreamQualityLanguageFilterRow(
++            groups = streamsUiState.groups,
++            selectedQualities = streamsUiState.qualityFilters,
++            selectedLanguages = streamsUiState.languageFilters,
++            onQualityToggled = { PlayerStreamsRepository.toggleEpisodeStreamsQualityFilter(it) },
++            onLanguageToggled = { PlayerStreamsRepository.toggleEpisodeStreamsLanguageFilter(it) },
++            onClearFilters = { PlayerStreamsRepository.clearEpisodeSourceFilters() },
++            modifier = Modifier.padding(top = 8.dp),
++        )
++
+         Spacer(Modifier.height(16.dp))
+ 
+         PlayerStreamList(
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
+old mode 100644
+new mode 100755
+index f547f21..cc2c170
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
+@@ -13,6 +13,7 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import com.nuvio.app.core.ui.nuvio
+ import com.nuvio.app.features.streams.StreamItem
++import com.nuvio.app.features.streams.StreamQualityLanguageFilterRow
+ import com.nuvio.app.features.streams.StreamsUiState
+ import nuvio.composeapp.generated.resources.Res
+ import nuvio.composeapp.generated.resources.action_close
+@@ -87,6 +88,16 @@ fun PlayerSourcesPanel(
+                 onRefresh = onReload,
+             )
+ 
++            StreamQualityLanguageFilterRow(
++                groups = streamsUiState.groups,
++                selectedQualities = streamsUiState.qualityFilters,
++                selectedLanguages = streamsUiState.languageFilters,
++                onQualityToggled = { PlayerStreamsRepository.toggleSourceQualityFilter(it) },
++                onLanguageToggled = { PlayerStreamsRepository.toggleSourceLanguageFilter(it) },
++                onClearFilters = { PlayerStreamsRepository.clearSourceFilters() },
++                modifier = Modifier.padding(top = 8.dp),
++            )
++
+             Spacer(Modifier.height(16.dp))
+ 
+             PlayerStreamList(
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamList.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamList.kt
+index 83d25db..cd92405 100644
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamList.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamList.kt
+@@ -12,6 +12,7 @@ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Alignment
+@@ -21,13 +22,17 @@ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.nuvio.app.features.debrid.DebridSettingsRepository
+ import com.nuvio.app.features.streams.LocalStreamSizeLabelFormat
++import com.nuvio.app.features.streams.SourceHealthRepository
+ import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
++import com.nuvio.app.features.streams.StreamBestSourcesSection
+ import com.nuvio.app.features.streams.StreamCard
+ import com.nuvio.app.features.streams.StreamCardSkeleton
+ import com.nuvio.app.features.streams.StreamItem
+ import com.nuvio.app.features.streams.StreamsUiState
+ import com.nuvio.app.features.streams.isSelectableForPlayback
++import com.nuvio.app.features.streams.isStreamTesting
+ import com.nuvio.app.features.streams.rememberStreamSizeLabelFormat
++import com.nuvio.app.features.streams.sourceHealthHost
+ import nuvio.composeapp.generated.resources.Res
+ import nuvio.composeapp.generated.resources.compose_player_no_streams_found
+ import org.jetbrains.compose.resources.stringResource
+@@ -58,6 +63,10 @@ internal fun PlayerStreamList(
+     val streams = streamsUiState.allStreams
+     val visibleGroups = streamsUiState.filteredGroups
+ 
++    LaunchedEffect(streamsUiState.groups) {
++        SourceHealthRepository.registerStreams(streamsUiState.groups.flatMap { group -> group.streams })
++    }
++
+     when {
+         streams.isEmpty() && streamsUiState.isAnyLoading -> {
+             Column(
+@@ -95,6 +104,17 @@ internal fun PlayerStreamList(
+                 verticalArrangement = Arrangement.spacedBy(8.dp),
+                 contentPadding = contentPadding,
+             ) {
++                val bestSources = streamsUiState.bestSources
++                if (bestSources.isNotEmpty()) {
++                    item(key = "best_sources") {
++                        StreamBestSourcesSection(
++                            sources = bestSources,
++                            health = streamsUiState.sourceHealth,
++                            onStreamSelected = onStreamSelected,
++                            modifier = Modifier.padding(bottom = 8.dp),
++                        )
++                    }
++                }
+                 itemsIndexed(
+                     items = streams,
+                     key = { index, _ -> streamKeys[index] },
+@@ -109,6 +129,10 @@ internal fun PlayerStreamList(
+                         badgePlacement = streamBadgeSettings.badgePlacement,
+                         isCurrent = stream.isCurrentPlayerStream(currentStreamUrl, currentStreamName),
+                         currentLabel = currentLabel,
++                        isTesting = streamsUiState.sourceHealth.isStreamTesting(stream),
++                        latencyMs = stream.sourceHealthHost()?.let { host ->
++                            streamsUiState.sourceHealth.entryFor(host).latencyMs
++                        },
+                         onClick = { onStreamSelected(stream) },
+                     )
+                 }
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
+old mode 100644
+new mode 100755
+index 55a3dae..c829582
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
+@@ -20,6 +20,9 @@ import com.nuvio.app.features.streams.InstalledStreamAddonTarget
+ import com.nuvio.app.features.streams.StreamAutoPlaySelector
+ import com.nuvio.app.features.streams.StreamBadgePresentation
+ import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
++import com.nuvio.app.features.streams.StreamQualityFilter
++import com.nuvio.app.features.streams.StreamSourceFilterPrefs
++import com.nuvio.app.features.streams.SourceHealthRepository
+ import com.nuvio.app.features.streams.StreamItem
+ import com.nuvio.app.features.streams.StreamLoadCompletion
+ import com.nuvio.app.features.streams.StreamParser
+@@ -53,17 +56,28 @@ object PlayerStreamsRepository {
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+ 
+     // source panel
+-    private val _sourceState = MutableStateFlow(StreamsUiState())
++    private fun seedStreamFilters(): StreamsUiState = StreamsUiState()
++
++    private val _sourceState = MutableStateFlow(seedStreamFilters())
+     val sourceState: StateFlow<StreamsUiState> = _sourceState.asStateFlow()
+     private var sourceJob: Job? = null
+     private var sourceRequestKey: String? = null
+ 
+     // episode streams panel
+-    private val _episodeStreamsState = MutableStateFlow(StreamsUiState())
++    private val _episodeStreamsState = MutableStateFlow(seedStreamFilters())
+     val episodeStreamsState: StateFlow<StreamsUiState> = _episodeStreamsState.asStateFlow()
+     private var episodeStreamsJob: Job? = null
+     private var episodeStreamsRequestKey: String? = null
+ 
++    init {
++        scope.launch {
++            SourceHealthRepository.state.collect { snapshot ->
++                _sourceState.update { current -> current.copy(sourceHealth = snapshot) }
++                _episodeStreamsState.update { current -> current.copy(sourceHealth = snapshot) }
++            }
++        }
++    }
++
+     fun loadSources(
+         type: String,
+         videoId: String,
+@@ -161,6 +175,50 @@ object PlayerStreamsRepository {
+         _episodeStreamsState.update { it.copy(selectedFilter = addonId) }
+     }
+ 
++    fun toggleSourceQualityFilter(value: StreamQualityFilter) {
++        val next = _sourceState.value.qualityFilters.toMutableSet().apply {
++            if (!add(value)) remove(value)
++        }
++        _sourceState.update { it.copy(qualityFilters = next) }
++        StreamSourceFilterPrefs.updateQualities(next.map { quality -> quality.label }.toSet())
++    }
++
++    fun toggleSourceLanguageFilter(value: String) {
++        val next = _sourceState.value.languageFilters.toMutableSet().apply {
++            val existing = firstOrNull { it.equals(value, ignoreCase = true) }
++            if (existing != null) remove(existing) else add(value)
++        }
++        _sourceState.update { it.copy(languageFilters = next) }
++        StreamSourceFilterPrefs.updateLanguages(next)
++    }
++
++    fun clearSourceFilters() {
++        _sourceState.update { it.copy(qualityFilters = emptySet(), languageFilters = emptySet()) }
++        StreamSourceFilterPrefs.clear()
++    }
++
++    fun toggleEpisodeStreamsQualityFilter(value: StreamQualityFilter) {
++        val next = _episodeStreamsState.value.qualityFilters.toMutableSet().apply {
++            if (!add(value)) remove(value)
++        }
++        _episodeStreamsState.update { it.copy(qualityFilters = next) }
++        StreamSourceFilterPrefs.updateQualities(next.map { quality -> quality.label }.toSet())
++    }
++
++    fun toggleEpisodeStreamsLanguageFilter(value: String) {
++        val next = _episodeStreamsState.value.languageFilters.toMutableSet().apply {
++            val existing = firstOrNull { it.equals(value, ignoreCase = true) }
++            if (existing != null) remove(existing) else add(value)
++        }
++        _episodeStreamsState.update { it.copy(languageFilters = next) }
++        StreamSourceFilterPrefs.updateLanguages(next)
++    }
++
++    fun clearEpisodeSourceFilters() {
++        _episodeStreamsState.update { it.copy(qualityFilters = emptySet(), languageFilters = emptySet()) }
++        StreamSourceFilterPrefs.clear()
++    }
++
+     fun clearEpisodeStreams() {
+         PluginRepository.setLocalPluginSearchPaused(true)
+         episodeStreamsJob?.cancel()
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealth.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealth.kt
+new file mode 100644
+index 0000000..c8faf6e
+--- /dev/null
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealth.kt
+@@ -0,0 +1,378 @@
++package com.nuvio.app.features.streams
++
++import co.touchlab.kermit.Logger
++import com.nuvio.app.core.ui.NuvioToastController
++import com.nuvio.app.features.addons.httpRequestRaw
++import com.nuvio.app.features.watchprogress.CurrentDateProvider
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.sync.withPermit
++import kotlinx.coroutines.withTimeoutOrNull
++import kotlin.time.TimeSource
++
++/**
++ * Health of a source host as measured by the background sweep. The sweep runs
++ * once per calendar day (see [SourceHealthRepository.bootstrap]) and again for
++ * any host the user runs into that has not been measured yet today.
++ */
++enum class SourceHealthStatus {
++    /** Queued for the current sweep. */
++    UNKNOWN,
++
++    /** Currently being probed. */
++    CHECKING,
++
++    /** Reachable: the server answered the probe. */
++    ONLINE,
++
++    /** Unreachable, timed out, or answered with an error status. */
++    OFFLINE,
++
++    /** Streams that cannot be probed over HTTP (torrents, magnets, debrid). */
++    UNPROBEABLE,
++}
++
++data class SourceHealthEntry(
++    val status: SourceHealthStatus = SourceHealthStatus.UNKNOWN,
++    val latencyMs: Long? = null,
++)
++
++data class SourceHealthSnapshot(
++    val day: String = "",
++    val hosts: Map<String, SourceHealthEntry> = emptyMap(),
++    val sweeping: Boolean = false,
++    val completed: Int = 0,
++    val total: Int = 0,
++) {
++    val isRunning: Boolean
++        get() = sweeping && completed < total
++
++    val progress: Float
++        get() = if (total <= 0) 0f else (completed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
++
++    val onlineCount: Int
++        get() = hosts.values.count { it.status == SourceHealthStatus.ONLINE }
++
++    fun entryFor(host: String?): SourceHealthEntry {
++        if (host == null) return SourceHealthEntry(status = SourceHealthStatus.UNPROBEABLE)
++        return hosts[host] ?: SourceHealthEntry(status = SourceHealthStatus.UNKNOWN)
++    }
++}
++
++/** True when [stream] may be listed: online, still being tested, or not probe-able. */
++fun SourceHealthSnapshot.isStreamVisible(stream: StreamItem): Boolean {
++    val host = stream.sourceHealthHost() ?: return true
++    return entryFor(host).status != SourceHealthStatus.OFFLINE
++}
++
++/** True while [stream] is queued or actively being probed. */
++fun SourceHealthSnapshot.isStreamTesting(stream: StreamItem): Boolean {
++    val host = stream.sourceHealthHost() ?: return false
++    return when (entryFor(host).status) {
++        SourceHealthStatus.CHECKING, SourceHealthStatus.UNKNOWN -> true
++        else -> false
++    }
++}
++
++/**
++ * Extracts the probe-able host of a stream. Returns null when the stream is not
++ * an HTTP asset (magnet/torrent/debrid/YouTube) so callers can treat it as
++ * [SourceHealthStatus.UNPROBEABLE] instead of hiding it.
++ */
++fun StreamItem.sourceHealthHost(): String? {
++    val candidate = playableDirectUrl ?: return null
++    val schemeEnd = candidate.indexOf("://")
++    if (schemeEnd <= 0) return null
++    val scheme = candidate.substring(0, schemeEnd).lowercase()
++    if (scheme != "http" && scheme != "https") return null
++    val afterScheme = candidate.substring(schemeEnd + 3)
++    val authorityEnd = afterScheme.indexOfFirst { it == '/' || it == '?' || it == '#' }
++    val authority = if (authorityEnd >= 0) afterScheme.substring(0, authorityEnd) else afterScheme
++    val host = authority.substringAfter('@').substringBefore(':').trim().lowercase()
++    return host.takeIf { it.isNotEmpty() }
++}
++
++/**
++ * Process-wide daily source health sweep.
++ *
++ * - [bootstrap] runs on app start: restores today's results, or starts a
++ *   background sweep over every host seen so far when the day rolled over.
++ *   Nothing is scheduled on the main thread and the UI stays responsive.
++ * - [registerStreams] runs when a source list is shown: hosts without a result
++ *   for today are queued, known hosts reuse their cached verdict.
++ * - Only [SourceHealthStatus.OFFLINE] sources are hidden. Queued sources stay
++ *   visible with a testing state so servers appear progressively as they pass.
++ * - A Nuvio-styled toast is shown once per day when the launch sweep finishes.
++ */
++object SourceHealthRepository {
++    private val log = Logger.withTag("SourceHealth")
++    private const val probeTimeoutMs = 6_000L
++    private const val maxConcurrentProbes = 6
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
++    private val probeSemaphore = Semaphore(maxConcurrentProbes)
++    private val bookkeeping = Mutex()
++    private val launchedHosts = mutableSetOf<String>()
++    private val sampleUrls = MutableStateFlow<Map<String, String>>(emptyMap())
++
++    private val _state = MutableStateFlow(SourceHealthSnapshot())
++    val state: StateFlow<SourceHealthSnapshot> = _state.asStateFlow()
++
++    private var bootstrapped = false
++    private var dailySweepActive = false
++    private var lastToastedDay: String? = null
++    private var toastJob: Job? = null
++
++    fun bootstrap() {
++        if (bootstrapped) return
++        bootstrapped = true
++
++        val today = CurrentDateProvider.todayIsoDate()
++        val restored = parsePersisted(runCatching { SourceHealthStorage.loadPayload() }.getOrNull())
++
++        if (restored.day == today) {
++            _state.value = SourceHealthSnapshot(
++                day = today,
++                hosts = restored.hosts,
++                sweeping = false,
++                completed = restored.hosts.size,
++                total = restored.hosts.size,
++            )
++            sampleUrls.value = restored.sampleUrls
++            log.d { "Restored ${restored.hosts.size} source health results for $today" }
++            return
++        }
++
++        if (restored.hosts.isEmpty()) {
++            _state.value = SourceHealthSnapshot(day = today)
++            return
++        }
++
++        // New calendar day: drop yesterday's verdicts and re-test every known host.
++        dailySweepActive = true
++        val pending = restored.hosts.keys.map { host ->
++            host to SourceHealthEntry(status = SourceHealthStatus.UNKNOWN)
++        }.toMap()
++        sampleUrls.value = restored.sampleUrls
++        _state.value = SourceHealthSnapshot(
++            day = today,
++            hosts = pending,
++            sweeping = true,
++            completed = 0,
++            total = pending.size,
++        )
++        log.d { "Starting daily source sweep for ${pending.size} hosts on $today" }
++        pending.keys.forEach { host -> enqueue(host) }
++    }
++
++    /** Queues probes for any host in [streams] that has no result for today. */
++    fun registerStreams(streams: List<StreamItem>) {
++        if (streams.isEmpty()) return
++        val today = CurrentDateProvider.todayIsoDate()
++        val toProbe = mutableListOf<String>()
++
++        _state.update { snapshot ->
++            val base = if (snapshot.day == today) snapshot else SourceHealthSnapshot(day = today)
++            val hosts = base.hosts.toMutableMap()
++            streams.forEach { stream ->
++                val host = stream.sourceHealthHost() ?: return@forEach
++                val sample = stream.playableDirectUrl ?: return@forEach
++                val previousSample = sampleUrls.value[host]
++                val sampleChanged = previousSample != null && previousSample != sample
++                sampleUrls.update { it + (host to sample) }
++                val existing = hosts[host]
++                val needsProbe = existing == null ||
++                    existing.status == SourceHealthStatus.UNKNOWN ||
++                    // A fresh list can hand us a new signed URL for a host we
++                    // marked offline earlier today: give it one more chance.
++                    (existing.status == SourceHealthStatus.OFFLINE && sampleChanged)
++                if (needsProbe) {
++                    hosts[host] = SourceHealthEntry(status = SourceHealthStatus.CHECKING)
++                    toProbe += host
++                }
++            }
++            base.copy(
++                hosts = hosts,
++                sweeping = base.sweeping || toProbe.isNotEmpty(),
++                total = if (base.total == 0) hosts.size else maxOf(base.total, hosts.size),
++            )
++        }
++
++        toProbe.forEach { host -> enqueue(host) }
++    }
++
++    private fun enqueue(host: String) {
++        scope.launch {
++            val claimed = bookkeeping.withLock {
++                if (host in launchedHosts) false else {
++                    launchedHosts += host
++                    true
++                }
++            }
++            if (!claimed) return@launch
++            // A new probe landed before the "testing done" toast fired: hold it
++            // back so the popup only appears once the visible list is settled.
++            toastJob?.cancel()
++
++            probeSemaphore.withPermit {
++                val sample = sampleUrls.value[host]
++                val entry = if (sample.isNullOrBlank()) {
++                    SourceHealthEntry(status = SourceHealthStatus.UNPROBEABLE)
++                } else {
++                    probe(sample)
++                }
++                _state.update { snapshot ->
++                    snapshot.copy(
++                        hosts = snapshot.hosts + (host to entry),
++                        completed = snapshot.completed + 1,
++                    )
++                }
++                bookkeeping.withLock { launchedHosts -= host }
++                completeIfFinished()
++            }
++        }
++    }
++
++    private fun completeIfFinished() {
++        val snapshot = _state.value
++        if (!snapshot.sweeping) return
++        val stillRunning = snapshot.hosts.values.any {
++            it.status == SourceHealthStatus.CHECKING || it.status == SourceHealthStatus.UNKNOWN
++        }
++        if (stillRunning) return
++
++        val finishedDailySweep = dailySweepActive
++        dailySweepActive = false
++        _state.update {
++            it.copy(sweeping = false, completed = it.total, total = maxOf(it.total, it.hosts.size))
++        }
++        persist()
++        // One "testing done" toast per calendar day, whichever sweep finished
++        // first (the launch sweep, or the first source list of the day). It is
++        // debounced so addon groups that arrive a moment later stay included.
++        if (lastToastedDay != snapshot.day) {
++            toastJob?.cancel()
++            toastJob = scope.launch {
++                delay(3_000L)
++                val current = _state.value
++                if (current.isRunning) return@launch
++                if (lastToastedDay == current.day) return@launch
++                lastToastedDay = current.day
++                NuvioToastController.show(SourceHealthTexts.testingDone, durationMillis = 2_400L)
++            }
++        }
++        if (finishedDailySweep) {
++            log.d { "Daily source sweep finished for ${snapshot.day}" }
++        }
++    }
++
++    /** True when the source may be listed (online, untested or not probe-able). */
++    fun isSourcePassing(stream: StreamItem): Boolean {
++        val host = stream.sourceHealthHost() ?: return true
++        return _state.value.entryFor(host).status != SourceHealthStatus.OFFLINE
++    }
++
++    /** True while this source is queued or in flight. */
++    fun isSourceTesting(stream: StreamItem): Boolean {
++        val host = stream.sourceHealthHost() ?: return false
++        return when (_state.value.entryFor(host).status) {
++            SourceHealthStatus.CHECKING, SourceHealthStatus.UNKNOWN -> true
++            else -> false
++        }
++    }
++
++    fun latencyFor(host: String?): Long? = host?.let { _state.value.entryFor(it).latencyMs }
++
++    private suspend fun probe(url: String): SourceHealthEntry {
++        val mark = TimeSource.Monotonic.markNow()
++        val response = withTimeoutOrNull(probeTimeoutMs) {
++            runCatching {
++                httpRequestRaw(
++                    method = "GET",
++                    url = url,
++                    headers = mapOf("Range" to "bytes=0-0"),
++                    body = "",
++                    maxResponseBodyBytes = 2_048,
++                )
++            }.getOrNull()
++        }
++        val elapsed = mark.elapsedNow().inWholeMilliseconds
++        return when {
++            response == null -> SourceHealthEntry(status = SourceHealthStatus.OFFLINE)
++            response.status in 200..399 -> SourceHealthEntry(
++                status = SourceHealthStatus.ONLINE,
++                latencyMs = elapsed,
++            )
++            else -> SourceHealthEntry(status = SourceHealthStatus.OFFLINE)
++        }
++    }
++
++    private fun persist() {
++        val snapshot = _state.value
++        if (snapshot.hosts.isEmpty()) return
++        val samples = sampleUrls.value
++        val payload = buildString {
++            append("d=")
++            append(snapshot.day)
++            append('\n')
++            snapshot.hosts.forEach { (host, entry) ->
++                append(host)
++                append('\t')
++                append(entry.status.name)
++                append('\t')
++                append(entry.latencyMs?.toString().orEmpty())
++                append('\t')
++                append(samples[host].orEmpty())
++                append('\n')
++            }
++        }
++        runCatching { SourceHealthStorage.savePayload(payload) }
++    }
++
++    private data class PersistedHealth(
++        val day: String,
++        val hosts: Map<String, SourceHealthEntry>,
++        val sampleUrls: Map<String, String>,
++    )
++
++    private fun parsePersisted(payload: String?): PersistedHealth {
++        if (payload.isNullOrBlank()) return PersistedHealth("", emptyMap(), emptyMap())
++        var day = ""
++        val hosts = mutableMapOf<String, SourceHealthEntry>()
++        val samples = mutableMapOf<String, String>()
++        payload.lineSequence().forEach { line ->
++            if (line.isBlank()) return@forEach
++            if (line.startsWith("d=")) {
++                day = line.removePrefix("d=").trim()
++                return@forEach
++            }
++            val parts = line.split('\t')
++            if (parts.size < 2) return@forEach
++            val host = parts[0].trim()
++            if (host.isEmpty()) return@forEach
++            val status = runCatching { SourceHealthStatus.valueOf(parts[1].trim()) }
++                .getOrElse { SourceHealthStatus.UNKNOWN }
++            val latency = parts.getOrNull(2)?.trim()?.takeIf { it.isNotEmpty() }?.toLongOrNull()
++            val sample = parts.getOrNull(3)?.trim()?.takeIf { it.isNotEmpty() }
++            hosts[host] = SourceHealthEntry(status = status, latencyMs = latency)
++            if (sample != null) samples[host] = sample
++        }
++        return PersistedHealth(day = day, hosts = hosts, sampleUrls = samples)
++    }
++}
++
++/** Strings used by the source health sweep. */
++internal object SourceHealthTexts {
++    const val testingDone: String = "Testing done"
++}
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.kt
+new file mode 100644
+index 0000000..f7409c2
+--- /dev/null
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.kt
+@@ -0,0 +1,6 @@
++package com.nuvio.app.features.streams
++
++internal expect object SourceHealthStorage {
++    fun loadPayload(): String?
++    fun savePayload(payload: String)
++}
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamCard.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamCard.kt
+index 5dffa35..66531d4 100644
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamCard.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamCard.kt
+@@ -67,6 +67,8 @@ internal fun StreamCard(
+     isCurrent: Boolean = false,
+     currentLabel: String? = null,
+     outlined: Boolean = false,
++    isTesting: Boolean = false,
++    latencyMs: Long? = null,
+ ) {
+     val partyLabel = if (isCurrent) null else LocalStreamHighlight.current(stream)
+     val cardShape = RoundedCornerShape(12.dp)
+@@ -163,6 +165,11 @@ internal fun StreamCard(
+             }
+         }
+ 
++        if (isTesting || latencyMs != null) {
++            Spacer(modifier = Modifier.width(10.dp))
++            SourceHealthBadge(isTesting = isTesting, latencyMs = latencyMs)
++        }
++
+         if (showAddonLogo) {
+             Spacer(modifier = Modifier.width(12.dp))
+             Column(
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
+old mode 100644
+new mode 100755
+index 28bee25..12782ec
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
+@@ -134,6 +134,32 @@ data class StreamItem(
+ 
+     val needsServerPreparation: Boolean
+         get() = serverTarget != null && playableDirectUrl == null
++
++    internal val sourceFilterText: String by lazy {
++        buildString {
++            append(name.orEmpty())
++            append(' ')
++            append(title.orEmpty())
++            append(' ')
++            append(description.orEmpty())
++            append(' ')
++            append(sourceName.orEmpty())
++            append(' ')
++            append(streamType.orEmpty())
++            append(' ')
++            append(clientResolve?.stream?.raw?.parsed?.quality.orEmpty())
++            append(' ')
++            append(clientResolve?.stream?.raw?.parsed?.resolution.orEmpty())
++            badges.forEach { badge ->
++                append(' ')
++                append(badge.name)
++            }
++        }
++    }
++
++    val sourceFilterQualities: Set<StreamQualityFilter> by lazy { deriveSourceFilterQualities(this) }
++
++    val sourceFilterLanguages: Set<String> by lazy { deriveSourceFilterLanguages(this) }
+ }
+ 
+ @Serializable
+@@ -318,6 +344,9 @@ data class StreamsUiState(
+     val groups: List<AddonStreamGroup> = emptyList(),
+     val activeAddonIds: Set<String> = emptySet(),
+     val selectedFilter: String? = null,
++    val qualityFilters: Set<StreamQualityFilter> = StreamSourceFilterPrefs.selectedQualities(),
++    val languageFilters: Set<String> = StreamSourceFilterPrefs.state.value.languages,
++    val sourceHealth: SourceHealthSnapshot = SourceHealthRepository.state.value,
+     val isAnyLoading: Boolean = false,
+     val emptyStateReason: StreamsEmptyStateReason? = null,
+     val autoPlayStream: StreamItem? = null,
+@@ -327,8 +356,40 @@ data class StreamsUiState(
+     val overlayMessage: String? = null,
+ ) {
+     val filteredGroups: List<AddonStreamGroup>
+-        get() = if (selectedFilter == null) groups
+-                else groups.filter { it.addonId == selectedFilter }
++        get() {
++            val base = if (selectedFilter == null) groups
++            else groups.filter { it.addonId == selectedFilter }
++            // Multi-select filters: OR inside the quality group, OR inside the
++            // language group, AND across the two groups. Sources that failed the
++            // daily health sweep are dropped here, so every list in the app
++            // (phone, tablet and in-player) shows the same passing servers.
++            return base
++                .map { group ->
++                    group.copy(
++                        streams = group.streams.filter { stream ->
++                            stream.matchesSourceFilters(qualityFilters, languageFilters) &&
++                                sourceHealth.isStreamVisible(stream)
++                        },
++                    )
++                }
++                .filter { it.streams.isNotEmpty() || it.isLoading }
++        }
++
++    /** Best "balanced" sources among the passing, filtered ones. */
++    val bestSources: List<StreamItem>
++        get() = allStreams
++            .filter { stream ->
++                stream.sourceHealthHost()?.let { host ->
++                    sourceHealth.entryFor(host).status == SourceHealthStatus.ONLINE
++                } ?: false
++            }
++            .sortedByDescending { stream ->
++                stream.bestSourceScore(stream.sourceHealthHost()?.let { sourceHealth.entryFor(it).latencyMs })
++            }
++            .take(3)
++
++    val isTestingSources: Boolean
++        get() = sourceHealth.isRunning
+ 
+     val allStreams: List<StreamItem>
+         get() = filteredGroups.flatMap { it.streams }
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt
+new file mode 100644
+index 0000000..f813ea2
+--- /dev/null
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt
+@@ -0,0 +1,6 @@
++package com.nuvio.app.features.streams
++
++internal expect object StreamSourceFilterStorage {
++    fun loadPayload(): String?
++    fun savePayload(payload: String)
++}
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt
+new file mode 100644
+index 0000000..0e357c8
+--- /dev/null
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt
+@@ -0,0 +1,519 @@
++package com.nuvio.app.features.streams
++
++import androidx.compose.animation.animateColorAsState
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.interaction.MutableInteractionSource
++import androidx.compose.foundation.interaction.collectIsPressedAsState
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.LazyRow
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.nuvio.app.core.ui.NuvioTokens
++import com.nuvio.app.core.ui.nuvio
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++
++/**
++ * Quality buckets used by the source filter row. Buckets are derived from the
++ * stream name/title/badges, so they work for every addon and debrid provider
++ * without extra metadata support.
++ */
++enum class StreamQualityFilter(val label: String) {
++    ULTRA("4K"),
++    FHD("1080p"),
++    HD("720p"),
++    SD("SD");
++
++    /** Rough "how good is this" weight used by the balanced best-source rank. */
++    val qualityWeight: Float
++        get() = when (this) {
++            ULTRA -> 1f
++            FHD -> 0.85f
++            HD -> 0.68f
++            SD -> 0.42f
++        }
++
++    companion object {
++        val DISPLAY_ORDER: List<StreamQualityFilter> = listOf(ULTRA, FHD, HD, SD)
++
++        fun fromLabel(label: String?): StreamQualityFilter? =
++            label?.trim()?.takeIf { it.isNotEmpty() }
++                ?.let { candidate -> entries.firstOrNull { it.label.equals(candidate, ignoreCase = true) } }
++    }
++}
++
++private val QUALITY_TOKEN_PATTERNS: Map<StreamQualityFilter, List<Regex>> = mapOf(
++    StreamQualityFilter.ULTRA to listOf(
++        Regex("\\b4k\\b", RegexOption.IGNORE_CASE),
++        Regex("\\b2160p?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\buhd\\b", RegexOption.IGNORE_CASE),
++    ),
++    StreamQualityFilter.FHD to listOf(
++        Regex("\\b1080[pi]?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfull[\\s._-]?hd\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfhd\\b", RegexOption.IGNORE_CASE),
++    ),
++    StreamQualityFilter.HD to listOf(
++        Regex("\\b720p?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bhdrip\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bhd\\b", RegexOption.IGNORE_CASE),
++    ),
++    StreamQualityFilter.SD to listOf(
++        Regex("\\b480p?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\b360p?\\b", RegexOption.IGNORE_CASE),
++        Regex("\\b480i\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bdvdrip\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bcamrip\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bcam\\b", RegexOption.IGNORE_CASE),
++    ),
++)
++
++private val LANGUAGE_TOKEN_PATTERNS: Map<String, List<Regex>> = linkedMapOf(
++    "English" to listOf(
++        Regex("\\benglish\\b", RegexOption.IGNORE_CASE),
++        Regex("\\beng\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Hindi" to listOf(
++        Regex("\\bhindi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bhin\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Tamil" to listOf(
++        Regex("\\btamil\\b", RegexOption.IGNORE_CASE),
++        Regex("\\btam\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Telugu" to listOf(
++        Regex("\\btelugu\\b", RegexOption.IGNORE_CASE),
++        Regex("\\btel\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Malayalam" to listOf(
++        Regex("\\bmalayalam\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bmal\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Kannada" to listOf(
++        Regex("\\bkannada\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bkan\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Bengali" to listOf(
++        Regex("\\bbengali\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bbangla\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bben\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Marathi" to listOf(
++        Regex("\\bmarathi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bmar\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Punjabi" to listOf(
++        Regex("\\bpunjabi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bpanjabi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bpan\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Gujarati" to listOf(
++        Regex("\\bgujarati\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bguj\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Urdu" to listOf(
++        Regex("\\burdu\\b", RegexOption.IGNORE_CASE),
++        Regex("\\burd\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Spanish" to listOf(
++        Regex("\\bspanish\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bespanol\\b", RegexOption.IGNORE_CASE),
++        Regex("\\besp\\b", RegexOption.IGNORE_CASE),
++        Regex("\\blatino\\b", RegexOption.IGNORE_CASE),
++    ),
++    "French" to listOf(
++        Regex("\\bfrench\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfra\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfre\\b", RegexOption.IGNORE_CASE),
++    ),
++    "German" to listOf(
++        Regex("\\bgerman\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bger\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bdeu\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Italian" to listOf(
++        Regex("\\bitalian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bita\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Portuguese" to listOf(
++        Regex("\\bportuguese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bportuguês\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bpor\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bbrazilian\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Russian" to listOf(
++        Regex("\\brussian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\brus\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Japanese" to listOf(
++        Regex("\\bjapanese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bjpn\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Korean" to listOf(
++        Regex("\\bkorean\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bkor\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Chinese" to listOf(
++        Regex("\\bchinese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bmandarin\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bchi\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bzho\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Cantonese" to listOf(
++        Regex("\\bcantonese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\byue\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Arabic" to listOf(
++        Regex("\\barabic\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bara\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Turkish" to listOf(
++        Regex("\\bturkish\\b", RegexOption.IGNORE_CASE),
++        Regex("\\btur\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Dutch" to listOf(
++        Regex("\\bdutch\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bdut\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bnld\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Polish" to listOf(
++        Regex("\\bpolish\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bpol\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Indonesian" to listOf(
++        Regex("\\bindonesian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bbahasa\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Vietnamese" to listOf(
++        Regex("\\bvietnamese\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bvie\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Thai" to listOf(
++        Regex("\\bthai\\b", RegexOption.IGNORE_CASE),
++        Regex("\\btha\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Tagalog" to listOf(
++        Regex("\\btagalog\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfilipino\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Ukrainian" to listOf(
++        Regex("\\bukrainian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bukr\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Persian" to listOf(
++        Regex("\\bpersian\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bfarsi\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Hebrew" to listOf(
++        Regex("\\bhebrew\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Nepali" to listOf(
++        Regex("\\bnepali\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bnep\\b", RegexOption.IGNORE_CASE),
++    ),
++    "Sinhala" to listOf(
++        Regex("\\bsinhala\\b", RegexOption.IGNORE_CASE),
++        Regex("\\bsin\\b", RegexOption.IGNORE_CASE),
++    ),
++)
++
++fun deriveSourceFilterQualities(item: StreamItem): Set<StreamQualityFilter> {
++    val text = item.sourceFilterText
++    if (text.isBlank()) return emptySet()
++    return StreamQualityFilter.DISPLAY_ORDER.filter { filter ->
++        QUALITY_TOKEN_PATTERNS[filter].orEmpty().any { pattern -> pattern.containsMatchIn(text) }
++    }.toSet()
++}
++
++fun deriveSourceFilterLanguages(item: StreamItem): Set<String> {
++    val text = item.sourceFilterText
++    if (text.isBlank()) return emptySet()
++    return LANGUAGE_TOKEN_PATTERNS.filterValues { patterns ->
++        patterns.any { pattern -> pattern.containsMatchIn(text) }
++    }.keys
++}
++
++/** True when the stream survives the active quality + language selection. */
++fun StreamItem.matchesSourceFilters(
++    qualities: Set<StreamQualityFilter>,
++    languages: Set<String>,
++): Boolean {
++    if (qualities.isEmpty() && languages.isEmpty()) return true
++    if (qualities.isNotEmpty() && sourceFilterQualities.none { it in qualities }) return false
++    if (languages.isNotEmpty() && sourceFilterLanguages.none { it in languages }) return false
++    return true
++}
++
++data class StreamSourceFilterState(
++    val qualities: Set<String> = emptySet(),
++    val languages: Set<String> = emptySet(),
++) {
++    val isEmpty: Boolean
++        get() = qualities.isEmpty() && languages.isEmpty()
++}
++
++/**
++ * Process-wide holder for the persisted source filter preference. Loaded from
++ * platform storage on first touch, saved on every change, and used to seed the
++ * stream lists so the preferred quality/language selection is active immediately.
++ */
++object StreamSourceFilterPrefs {
++    private val _state = MutableStateFlow(loadPersistedState())
++    val state: StateFlow<StreamSourceFilterState> = _state.asStateFlow()
++
++    private fun loadPersistedState(): StreamSourceFilterState {
++        val payload = runCatching { StreamSourceFilterStorage.loadPayload() }.getOrNull().orEmpty()
++        var qualities: Set<String> = emptySet()
++        var languages: Set<String> = emptySet()
++        payload.split('|').forEach { segment ->
++            val separator = segment.indexOf('=')
++            if (separator <= 0) return@forEach
++            val values = segment.substring(separator + 1)
++                .split(',')
++                .map { it.trim() }
++                .filter { it.isNotEmpty() }
++                .toSet()
++            when (segment.substring(0, separator).trim()) {
++                "q" -> qualities = values
++                "l" -> languages = values
++            }
++        }
++        return StreamSourceFilterState(qualities = qualities, languages = languages)
++    }
++
++    fun updateQualities(labels: Set<String>) {
++        val normalized = labels.mapNotNull { label -> StreamQualityFilter.fromLabel(label)?.label }.toSet()
++        _state.update { it.copy(qualities = normalized) }
++        persist()
++    }
++
++    fun updateLanguages(languages: Set<String>) {
++        _state.update {
++            it.copy(languages = languages.map { value -> value.trim() }.filter { value -> value.isNotEmpty() }.toSet())
++        }
++        persist()
++    }
++
++    fun clear() {
++        _state.value = StreamSourceFilterState()
++        persist()
++    }
++
++    fun selectedQualities(): Set<StreamQualityFilter> =
++        _state.value.qualities.mapNotNull { StreamQualityFilter.fromLabel(it) }.toSet()
++
++    private fun persist() {
++        val current = _state.value
++        val payload = "q=${current.qualities.joinToString(",")}|l=${current.languages.joinToString(",")}"
++        runCatching { StreamSourceFilterStorage.savePayload(payload) }
++    }
++}
++
++internal data class StreamSourceFilterAvailability(
++    val qualities: List<StreamQualityFilter>,
++    val languages: List<String>,
++) {
++    val isEmpty: Boolean
++        get() = qualities.isEmpty() && languages.isEmpty()
++}
++
++internal fun List<AddonStreamGroup>.deriveStreamSourceFilterAvailability(): StreamSourceFilterAvailability {
++    val streams = flatMap { it.streams }
++    if (streams.isEmpty()) return StreamSourceFilterAvailability(emptyList(), emptyList())
++    val qualities = StreamQualityFilter.DISPLAY_ORDER.filter { quality ->
++        streams.any { quality in it.sourceFilterQualities }
++    }
++    val counts = LinkedHashMap<String, Int>()
++    streams.forEach { stream ->
++        stream.sourceFilterLanguages.forEach { language ->
++            counts[language] = (counts[language] ?: 0) + 1
++        }
++    }
++    val languages = counts.entries.sortedByDescending { it.value }.map { it.key }
++    return StreamSourceFilterAvailability(qualities, languages)
++}
++
++/**
++ * Nuvio-styled multi-select filter row: quality chips followed by the languages
++ * present in the current list (most frequent first). Every chip is a pill that
++ * mirrors the app's existing buttons: accent fill when selected, muted surface
++ * with a subtle outline when not. Selecting multiple chips is allowed and the
++ * whole stream list is filtered by the result.
++ */
++@Composable
++internal fun StreamQualityLanguageFilterRow(
++    groups: List<AddonStreamGroup>,
++    selectedQualities: Set<StreamQualityFilter>,
++    selectedLanguages: Set<String>,
++    onQualityToggled: (StreamQualityFilter) -> Unit,
++    onLanguageToggled: (String) -> Unit,
++    onClearFilters: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val availability = remember(groups) { groups.deriveStreamSourceFilterAvailability() }
++    if (availability.isEmpty) return
++    val hasSelection = selectedQualities.isNotEmpty() || selectedLanguages.isNotEmpty()
++    LazyRow(
++        modifier = modifier.fillMaxWidth(),
++        horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s8),
++        contentPadding = PaddingValues(horizontal = NuvioTokens.Space.s2),
++    ) {
++        items(availability.qualities) { quality ->
++            NuvioFilterChip(
++                label = quality.label,
++                selected = quality in selectedQualities,
++                onClick = { onQualityToggled(quality) },
++            )
++        }
++        if (hasSelection) {
++            item {
++                NuvioFilterChip(
++                    label = "Reset",
++                    selected = false,
++                    outlined = true,
++                    onClick = onClearFilters,
++                )
++            }
++        }
++        if (availability.qualities.isNotEmpty() && availability.languages.isNotEmpty()) {
++            item {
++                Box(
++                    modifier = Modifier
++                        .height(32.dp)
++                        .padding(horizontal = NuvioTokens.Space.s2),
++                    contentAlignment = Alignment.Center,
++                ) {
++                    Box(
++                        modifier = Modifier
++                            .size(3.dp)
++                            .clip(RoundedCornerShape(NuvioTokens.Radius.full))
++                            .background(MaterialTheme.nuvio.colors.textDisabled),
++                    )
++                }
++            }
++        }
++        items(availability.languages) { language ->
++            NuvioFilterChip(
++                label = language,
++                selected = selectedLanguages.any { it.equals(language, ignoreCase = true) },
++                onClick = { onLanguageToggled(language) },
++            )
++        }
++    }
++}
++
++@Composable
++private fun NuvioFilterChip(
++    label: String,
++    selected: Boolean,
++    onClick: () -> Unit,
++    outlined: Boolean = false,
++) {
++    val tokens = MaterialTheme.nuvio.colors
++    val interactionSource = remember { MutableInteractionSource() }
++    val isPressed by interactionSource.collectIsPressedAsState()
++    val scale by animateFloatAsState(
++        targetValue = if (isPressed) 0.96f else 1f,
++        animationSpec = tween(durationMillis = 140),
++        label = "source_filter_chip_scale",
++    )
++    val containerColor by animateColorAsState(
++        targetValue = when {
++            selected -> tokens.accent
++            outlined -> tokens.surfaceElevated
++            else -> tokens.surfaceElevated.copy(alpha = 0.65f)
++        },
++        animationSpec = tween(durationMillis = 180),
++        label = "source_filter_chip_container",
++    )
++    val contentColor by animateColorAsState(
++        targetValue = when {
++            selected -> tokens.onAccent
++            outlined -> tokens.textSecondary
++            else -> tokens.textMuted
++        },
++        animationSpec = tween(durationMillis = 180),
++        label = "source_filter_chip_content",
++    )
++    val borderColor by animateColorAsState(
++        targetValue = when {
++            selected -> tokens.borderSelected
++            outlined -> tokens.borderStrong
++            else -> tokens.borderDefault
++        },
++        animationSpec = tween(durationMillis = 180),
++        label = "source_filter_chip_border",
++    )
++    Box(
++        modifier = Modifier
++            .graphicsLayer {
++                scaleX = scale
++                scaleY = scale
++            }
++            .height(32.dp)
++            .clip(RoundedCornerShape(NuvioTokens.Radius.full))
++            .background(containerColor)
++            .border(1.dp, borderColor, RoundedCornerShape(NuvioTokens.Radius.full))
++            .clickable(
++                interactionSource = interactionSource,
++                indication = null,
++                onClick = onClick,
++            )
++            .padding(horizontal = NuvioTokens.Space.s14),
++        contentAlignment = Alignment.Center,
++    ) {
++        Row(
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s6),
++        ) {
++            Text(
++                text = label,
++                style = MaterialTheme.typography.labelMedium.copy(
++                    fontSize = 13.sp,
++                    fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
++                    letterSpacing = 0.1.sp,
++                ),
++                color = contentColor,
++                maxLines = 1,
++            )
++        }
++    }
++}
++
++/**
++ * Balanced ranking used by the "Best available" strip: good quality with a
++ * quick streaming start. Latency dominates only when the gap is large, so a
++ * healthy 1080p source still beats a slow 4K one.
++ */
++internal fun StreamItem.bestSourceScore(latencyMs: Long?): Float {
++    val bestQuality = sourceFilterQualities.maxOfOrNull { it.qualityWeight } ?: 0.5f
++    val latencyScore = latencyMs?.let { latency ->
++        1f - (latency.coerceIn(0L, 4_000L).toFloat() / 4_000f)
++    } ?: 0.55f
++    return (bestQuality * 0.6f) + (latencyScore * 0.4f)
++}
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceHealthUi.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceHealthUi.kt
+new file mode 100644
+index 0000000..d070e94
+--- /dev/null
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceHealthUi.kt
+@@ -0,0 +1,240 @@
++package com.nuvio.app.features.streams
++
++import androidx.compose.animation.animateColorAsState
++import androidx.compose.animation.core.RepeatMode
++import androidx.compose.animation.core.animateFloat
++import androidx.compose.animation.core.infiniteRepeatable
++import androidx.compose.animation.core.rememberInfiniteTransition
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.alpha
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.nuvio.app.core.ui.NuvioTokens
++import com.nuvio.app.core.ui.nuvio
++
++/** Small "Testing" / latency pill shown on a source row. */
++@Composable
++internal fun SourceHealthBadge(
++    isTesting: Boolean,
++    latencyMs: Long?,
++    modifier: Modifier = Modifier,
++) {
++    val tokens = MaterialTheme.nuvio.colors
++    val transition = rememberInfiniteTransition(label = "source_health_pulse")
++    val pulse by transition.animateFloat(
++        initialValue = 0.35f,
++        targetValue = 1f,
++        animationSpec = infiniteRepeatable(
++            animation = tween(durationMillis = 850),
++            repeatMode = RepeatMode.Reverse,
++        ),
++        label = "source_health_pulse_alpha",
++    )
++    val label = when {
++        isTesting -> "Testing"
++        latencyMs != null -> formatSourceLatency(latencyMs)
++        else -> null
++    } ?: return
++
++    val container by animateColorAsState(
++        targetValue = if (isTesting) tokens.surfaceElevated.copy(alpha = 0.9f) else tokens.accent.copy(alpha = 0.14f),
++        animationSpec = tween(durationMillis = 180),
++        label = "source_health_container",
++    )
++    val content = if (isTesting) tokens.textMuted else tokens.accent
++
++    Row(
++        modifier = modifier
++            .clip(RoundedCornerShape(NuvioTokens.Radius.full))
++            .background(container)
++            .border(
++                width = 1.dp,
++                color = if (isTesting) tokens.borderDefault else tokens.borderSelected.copy(alpha = 0.5f),
++                shape = RoundedCornerShape(NuvioTokens.Radius.full),
++            )
++            .padding(horizontal = NuvioTokens.Space.s8, vertical = NuvioTokens.Space.s4),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s5),
++    ) {
++        Box(
++            modifier = Modifier
++                .size(6.dp)
++                .alpha(if (isTesting) pulse else 1f)
++                .clip(RoundedCornerShape(NuvioTokens.Radius.full))
++                .background(content),
++        )
++        Text(
++            text = label,
++            style = MaterialTheme.typography.labelSmall.copy(
++                fontSize = 11.sp,
++                fontWeight = FontWeight.SemiBold,
++            ),
++            color = content,
++            maxLines = 1,
++        )
++    }
++}
++
++internal fun formatSourceLatency(latencyMs: Long): String =
++    if (latencyMs < 1_000L) "${latencyMs}ms" else "${(latencyMs / 100L) / 10f}s"
++
++/**
++ * Nuvio-styled "Best available" strip. Lists the fastest, good-quality sources
++ * that survived the health sweep and the active language/quality filters, using
++ * a balanced score (quality weight + measured response time).
++ */
++@Composable
++internal fun StreamBestSourcesSection(
++    sources: List<StreamItem>,
++    health: SourceHealthSnapshot,
++    onStreamSelected: (StreamItem) -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    if (sources.isEmpty()) return
++    val tokens = MaterialTheme.nuvio.colors
++    Column(
++        modifier = modifier
++            .fillMaxWidth()
++            .clip(RoundedCornerShape(NuvioTokens.Radius.lg))
++            .background(tokens.surfaceElevated.copy(alpha = 0.6f))
++            .border(
++                width = 1.dp,
++                color = tokens.borderDefault,
++                shape = RoundedCornerShape(NuvioTokens.Radius.lg),
++            )
++            .padding(NuvioTokens.Space.s12),
++        verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s8),
++    ) {
++        Row(
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s8),
++        ) {
++            Box(
++                modifier = Modifier
++                    .size(8.dp)
++                    .clip(RoundedCornerShape(NuvioTokens.Radius.full))
++                    .background(tokens.accent),
++            )
++            Column {
++                Text(
++                    text = "Best available",
++                    style = MaterialTheme.typography.titleSmall.copy(
++                        fontSize = 14.sp,
++                        fontWeight = FontWeight.Bold,
++                    ),
++                    color = tokens.textPrimary,
++                )
++                Text(
++                    text = if (health.isRunning) "Fastest passing sources · still testing" else "Balanced quality and fast start",
++                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
++                    color = tokens.textMuted,
++                )
++            }
++        }
++        sources.forEachIndexed { index, stream ->
++            BestSourceRow(
++                rank = index + 1,
++                stream = stream,
++                latencyMs = stream.sourceHealthHost()?.let { health.entryFor(it).latencyMs },
++                onClick = { onStreamSelected(stream) },
++            )
++        }
++    }
++}
++
++@Composable
++private fun BestSourceRow(
++    rank: Int,
++    stream: StreamItem,
++    latencyMs: Long?,
++    onClick: () -> Unit,
++) {
++    val tokens = MaterialTheme.nuvio.colors
++    val quality = StreamQualityFilter.DISPLAY_ORDER.firstOrNull { it in stream.sourceFilterQualities }
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .clip(RoundedCornerShape(NuvioTokens.Radius.md))
++            .background(tokens.overlayHover)
++            .clickable(onClick = onClick)
++            .padding(horizontal = NuvioTokens.Space.s10, vertical = NuvioTokens.Space.s8),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s10),
++    ) {
++        Box(
++            modifier = Modifier
++                .size(22.dp)
++                .clip(RoundedCornerShape(NuvioTokens.Radius.full))
++                .background(tokens.accent.copy(alpha = 0.18f)),
++            contentAlignment = Alignment.Center,
++        ) {
++            Text(
++                text = rank.toString(),
++                style = MaterialTheme.typography.labelSmall.copy(
++                    fontSize = 11.sp,
++                    fontWeight = FontWeight.Bold,
++                ),
++                color = tokens.accent,
++            )
++        }
++        Text(
++            text = stream.displayName(),
++            style = MaterialTheme.typography.bodySmall.copy(
++                fontSize = 13.sp,
++                fontWeight = FontWeight.Medium,
++            ),
++            color = tokens.textPrimary,
++            maxLines = 1,
++            overflow = TextOverflow.Ellipsis,
++            modifier = Modifier.weight(1f),
++        )
++        if (quality != null) {
++            Text(
++                text = quality.label,
++                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
++                color = tokens.textSecondary,
++                modifier = Modifier
++                    .clip(RoundedCornerShape(NuvioTokens.Radius.sm))
++                    .background(tokens.overlaySelected)
++                    .padding(horizontal = NuvioTokens.Space.s6, vertical = NuvioTokens.Space.s2),
++            )
++        }
++        if (latencyMs != null) {
++            Spacer(modifier = Modifier.width(NuvioTokens.Space.s2))
++            Text(
++                text = formatSourceLatency(latencyMs),
++                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
++                color = tokens.success,
++            )
++        }
++    }
++}
++
++private fun StreamItem.displayName(): String =
++    name?.takeIf { it.isNotBlank() }
++        ?: title?.takeIf { it.isNotBlank() }
++        ?: sourceName?.takeIf { it.isNotBlank() }
++        ?: addonName
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
+old mode 100644
+new mode 100755
+index 58fd52c..169538c
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
+@@ -33,9 +33,22 @@ import kotlinx.coroutines.launch
+ object StreamsRepository {
+     private val log = Logger.withTag("StreamsRepo")
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+-    private val _uiState = MutableStateFlow(StreamsUiState())
++
++    private fun seedStreamFilters(): StreamsUiState = StreamsUiState()
++
++    private val _uiState = MutableStateFlow(seedStreamFilters())
+     val uiState: StateFlow<StreamsUiState> = _uiState.asStateFlow()
+ 
++    init {
++        // Mirror the background health sweep into the list state so that
++        // fail-off sources disappear and passing ones light up as they finish.
++        scope.launch {
++            SourceHealthRepository.state.collect { snapshot ->
++                _uiState.update { current -> current.copy(sourceHealth = snapshot) }
++            }
++        }
++    }
++
+     private var activeJob: Job? = null
+     private var activeRequestKey: String? = null
+ 
+@@ -647,6 +660,28 @@ object StreamsRepository {
+         _uiState.update { it.copy(selectedFilter = addonId) }
+     }
+ 
++    fun toggleQualityFilter(value: StreamQualityFilter) {
++        val next = _uiState.value.qualityFilters.toMutableSet().apply {
++            if (!add(value)) remove(value)
++        }
++        _uiState.update { it.copy(qualityFilters = next) }
++        StreamSourceFilterPrefs.updateQualities(next.map { quality -> quality.label }.toSet())
++    }
++
++    fun toggleLanguageFilter(value: String) {
++        val next = _uiState.value.languageFilters.toMutableSet().apply {
++            val existing = firstOrNull { it.equals(value, ignoreCase = true) }
++            if (existing != null) remove(existing) else add(value)
++        }
++        _uiState.update { it.copy(languageFilters = next) }
++        StreamSourceFilterPrefs.updateLanguages(next)
++    }
++
++    fun clearSourceFilters() {
++        _uiState.update { it.copy(qualityFilters = emptySet(), languageFilters = emptySet()) }
++        StreamSourceFilterPrefs.clear()
++    }
++
+     fun consumeAutoPlay() {
+         activeRequestKey = null
+         _uiState.update {
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
+old mode 100644
+new mode 100755
+index c003a58..9495dac
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
+@@ -497,6 +497,16 @@ private fun MobileStreamsLayout(
+                         onRefresh = onRefresh,
+                     )
+ 
++                    StreamQualityLanguageFilterRow(
++                        groups = uiState.groups,
++                        selectedQualities = uiState.qualityFilters,
++                        selectedLanguages = uiState.languageFilters,
++                        onQualityToggled = { StreamsRepository.toggleQualityFilter(it) },
++                        onLanguageToggled = { StreamsRepository.toggleLanguageFilter(it) },
++                        onClearFilters = { StreamsRepository.clearSourceFilters() },
++                        modifier = Modifier.padding(top = 8.dp),
++                    )
++
+                     StreamList(
+                         uiState = uiState,
+                         debridEnabled = debridEnabled,
+@@ -738,6 +748,13 @@ internal fun StreamList(
+     val hasGroups = filteredGroups.isNotEmpty()
+     val hasAnyStreams = filteredGroups.any { it.streams.isNotEmpty() }
+     val anyLoading = filteredGroups.any { it.isLoading }
++
++    // Kick off (or reuse) today's background health sweep for every source that
++    // is now on screen. The state flows back through StreamsUiState, so passed
++    // servers appear progressively and failed ones quietly drop out.
++    LaunchedEffect(uiState.groups) {
++        SourceHealthRepository.registerStreams(uiState.groups.flatMap { group -> group.streams })
++    }
+     val torrentNotSupportedText = stringResource(Res.string.streams_torrent_not_supported)
+     val fetchingText = stringResource(Res.string.streams_fetching)
+     val findingStreamsText = stringResource(Res.string.streams_finding_streams)
+@@ -794,6 +811,21 @@ internal fun StreamList(
+             }
+ 
+             else -> {
++                val bestSources = uiState.bestSources
++                if (bestSources.isNotEmpty()) {
++                    item(key = "best_sources") {
++                        StreamBestSourcesSection(
++                            sources = bestSources,
++                            health = uiState.sourceHealth,
++                            onStreamSelected = { stream ->
++                                if (stream.isSelectableForPlayback(debridEnabled)) {
++                                    onStreamSelected(stream, resumePositionMs, resumeProgressFraction)
++                                }
++                            },
++                            modifier = Modifier.padding(bottom = 12.dp),
++                        )
++                    }
++                }
+                 filteredGroups.forEachIndexed { groupIndex, group ->
+                     streamSection(
+                         sectionKey = streamSectionRenderKey(groupIndex = groupIndex, group = group),
+@@ -806,6 +838,7 @@ internal fun StreamList(
+                         badgePlacement = streamBadgeSettings.badgePlacement,
+                         torrentNotSupportedText = torrentNotSupportedText,
+                         fetchingText = fetchingText,
++                        sourceHealth = uiState.sourceHealth,
+                         onStreamSelected = onStreamSelected,
+                         onStreamLongPress = onStreamLongPress,
+                         resumePositionMs = resumePositionMs,
+@@ -837,6 +870,7 @@ private fun LazyListScope.streamSection(
+     badgePlacement: StreamBadgePlacement,
+     torrentNotSupportedText: String,
+     fetchingText: String,
++    sourceHealth: SourceHealthSnapshot,
+     onStreamSelected: (stream: StreamItem, resumePositionMs: Long?, resumeProgressFraction: Float?) -> Unit,
+     onStreamLongPress: (StreamItem) -> Unit,
+     resumePositionMs: Long?,
+@@ -891,6 +925,8 @@ private fun LazyListScope.streamSection(
+                 showFileSizeBadges = showFileSizeBadges,
+                 showAddonLogo = showAddonLogo,
+                 badgePlacement = badgePlacement,
++                isTesting = sourceHealth.isStreamTesting(stream),
++                latencyMs = stream.sourceHealthHost()?.let { host -> sourceHealth.entryFor(host).latencyMs },
+                 onClick = {
+                     if (isSelectable) {
+                         onStreamSelected(stream, resumePositionMs, resumeProgressFraction)
+diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
+old mode 100644
+new mode 100755
+index 956cdbf..465b456
+--- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
++++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
+@@ -210,6 +210,16 @@ internal fun TabletStreamsLayout(
+                             onRefresh = onRefresh,
+                         )
+ 
++                        StreamQualityLanguageFilterRow(
++                            groups = uiState.groups,
++                            selectedQualities = uiState.qualityFilters,
++                            selectedLanguages = uiState.languageFilters,
++                            onQualityToggled = { StreamsRepository.toggleQualityFilter(it) },
++                            onLanguageToggled = { StreamsRepository.toggleLanguageFilter(it) },
++                            onClearFilters = { StreamsRepository.clearSourceFilters() },
++                            modifier = Modifier.padding(top = 8.dp),
++                        )
++
+                         ActiveScrapersStatusBlock(
+                             groups = uiState.groups,
+                             modifier = Modifier.padding(bottom = 4.dp),
+diff --git a/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt
+new file mode 100644
+index 0000000..6ba1bd9
+--- /dev/null
++++ b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt
+@@ -0,0 +1,15 @@
++package com.nuvio.app.features.streams
++
++import com.nuvio.app.core.storage.ProfileScopedKey
++import platform.Foundation.NSUserDefaults
++
++internal actual object SourceHealthStorage {
++    private const val payloadKey = "stream_source_health_payload"
++
++    actual fun loadPayload(): String? =
++        NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of(payloadKey))
++
++    actual fun savePayload(payload: String) {
++        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of(payloadKey))
++    }
++}
+diff --git a/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt
+new file mode 100644
+index 0000000..1f28f57
+--- /dev/null
++++ b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt
+@@ -0,0 +1,15 @@
++package com.nuvio.app.features.streams
++
++import com.nuvio.app.core.storage.ProfileScopedKey
++import platform.Foundation.NSUserDefaults
++
++internal actual object StreamSourceFilterStorage {
++    private const val payloadKey = "stream_source_filters_payload"
++
++    actual fun loadPayload(): String? =
++        NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of(payloadKey))
++
++    actual fun savePayload(payload: String) {
++        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of(payloadKey))
++    }
++}
