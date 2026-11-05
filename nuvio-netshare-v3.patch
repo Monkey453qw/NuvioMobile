@@ -362,16 +362,14 @@ index 0323307..be87796 100644
              .connectTimeout(15, TimeUnit.SECONDS)
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt
 new file mode 100644
-index 0000000..a278058
+index 0000000..88bde0c
 --- /dev/null
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.android.kt
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,24 @@
 +package com.nuvio.app.features.streams
 +
 +import android.content.Context
 +import android.content.SharedPreferences
-+import com.nuvio.app.core.storage.ProfileScopedKey
-+
 +internal actual object SourceHealthStorage {
 +    private const val preferencesName = "nuvio_stream_source_health"
 +    private const val payloadKey = "stream_source_health_payload"
@@ -383,12 +381,12 @@ index 0000000..a278058
 +    }
 +
 +    actual fun loadPayload(): String? =
-+        preferences?.getString(ProfileScopedKey.of(payloadKey), null)
++        preferences?.getString(payloadKey, null)
 +
 +    actual fun savePayload(payload: String) {
 +        preferences
 +            ?.edit()
-+            ?.putString(ProfileScopedKey.of(payloadKey), payload)
++            ?.putString(payloadKey, payload)
 +            ?.apply()
 +    }
 +}
@@ -2176,23 +2174,22 @@ index 956cdbf..465b456
                              modifier = Modifier.padding(bottom = 4.dp),
 diff --git a/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt
 new file mode 100644
-index 0000000..6ba1bd9
+index 0000000..538cf70
 --- /dev/null
 +++ b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/SourceHealthStorage.ios.kt
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,14 @@
 +package com.nuvio.app.features.streams
 +
-+import com.nuvio.app.core.storage.ProfileScopedKey
 +import platform.Foundation.NSUserDefaults
 +
 +internal actual object SourceHealthStorage {
 +    private const val payloadKey = "stream_source_health_payload"
 +
 +    actual fun loadPayload(): String? =
-+        NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of(payloadKey))
++        NSUserDefaults.standardUserDefaults.stringForKey(payloadKey)
 +
 +    actual fun savePayload(payload: String) {
-+        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of(payloadKey))
++        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = payloadKey)
 +    }
 +}
 diff --git a/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt
