@@ -1,5 +1,5 @@
 diff --git a/composeApp/build.gradle.kts b/composeApp/build.gradle.kts
-index 69d1e2f..28feb76 100644
+index 69d1e2ff..28feb761 100644
 --- a/composeApp/build.gradle.kts
 +++ b/composeApp/build.gradle.kts
 @@ -447,6 +447,9 @@ kotlin {
@@ -13,7 +13,7 @@ index 69d1e2f..28feb76 100644
                  // libass - atlas-based subtitle rendering (from NuvioMedia/nuvio-libass)
                  implementation(files("libs/nuvio-libass-release.aar"))
 diff --git a/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt b/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
-index c1b3aa9..d202f84 100644
+index c1b3aa97..d202f84c 100644
 --- a/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
 +++ b/composeApp/src/androidFull/kotlin/com/nuvio/app/features/trailer/TrailerExtractionPlatform.android.kt
 @@ -1,7 +1,7 @@
@@ -44,7 +44,7 @@ index c1b3aa9..d202f84 100644
          .readTimeout(2, TimeUnit.SECONDS)
          .followRedirects(true)
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
-index eee68bd..3b14507 100644
+index eee68bdd..3b145074 100644
 --- a/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/MainActivity.kt
 @@ -62,6 +62,7 @@ import com.nuvio.app.features.simkl.SimklSyncStorage
@@ -90,7 +90,7 @@ index eee68bd..3b14507 100644
          MdbListSettingsStorage.initialize(applicationContext)
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt
 new file mode 100644
-index 0000000..f62e12c
+index 00000000..f62e12cc
 --- /dev/null
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/ResilientDns.kt
 @@ -0,0 +1,56 @@
@@ -152,7 +152,7 @@ index 0000000..f62e12c
 +}
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt
 new file mode 100644
-index 0000000..ef1d710
+index 00000000..ef1d7102
 --- /dev/null
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/core/network/SystemProxy.kt
 @@ -0,0 +1,86 @@
@@ -243,7 +243,7 @@ index 0000000..ef1d710
 +    }
 +}
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
-index 29d28f4..2ea542c 100644
+index 29d28f43..2ea542c9 100644
 --- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/addons/AddonPlatform.android.kt
 @@ -3,7 +3,7 @@ package com.nuvio.app.features.addons
@@ -287,7 +287,7 @@ index 29d28f4..2ea542c 100644
              if (cache != null) {
                  cache(cache)
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
-index 9c2dd19..d6dcec2 100644
+index 9c2dd19b..d6dcec27 100644
 --- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/downloads/AndroidDownloadTransfer.kt
 @@ -12,8 +12,13 @@ import kotlinx.coroutines.ensureActive
@@ -305,7 +305,7 @@ index 9c2dd19..d6dcec2 100644
      .readTimeout(60, TimeUnit.SECONDS)
      .writeTimeout(60, TimeUnit.SECONDS)
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
-index 9ec8dd1..8f482be 100644
+index b98b7449..661db46d 100644
 --- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerEngine.android.kt
 @@ -35,6 +35,7 @@ import androidx.compose.ui.unit.IntSize
@@ -316,7 +316,30 @@ index 9ec8dd1..8f482be 100644
  import com.nuvio.app.features.streams.redactedForLogs
  import kotlinx.coroutines.runBlocking
  import nuvio.composeapp.generated.resources.*
-@@ -1646,6 +1647,7 @@ private class NuvioLibmpvView(
+@@ -1490,6 +1491,10 @@ private fun LibmpvPlayerSurface(
+                     yuv420pEnabled = yuv420pEnabled,
+                 ).apply {
+                     layoutParams = android.view.ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
++                    // Pin an opaque pixel format before the surface exists.
++                    // RGBX drops the alpha channel at the compositor, so the
++                    // letterbox strips can never composite as translucent.
++                    runCatching { holder.setFormat(android.graphics.PixelFormat.RGBX_8888) }
+                     keepScreenOn = false
+                     runCatching {
+                         Utils.copyAssets(viewContext)
+@@ -1574,6 +1579,11 @@ private class NuvioLibmpvView(
+ 
+     override fun initOptions() {
+         setVo(videoOutput.mpvValue)
++        // The letterbox bars around the video are pixels rendered INSIDE the
++        // mpv SurfaceView; nothing the app draws behind it can ever cover
++        // them. Force an opaque background so gpu/gpu-next clear the bars
++        // opaque black even when the EGL driver hands us an RGBA window.
++        runCatching { mpv.setOptionString("background-color", "#FF000000") }
+         mpv.setOptionString("profile", "fast")
+         mpv.setOptionString("hwdec", if (hardwareDecodingEnabled) "auto" else "no")
+         if (yuv420pEnabled) {
+@@ -1647,6 +1657,7 @@ private class NuvioLibmpvView(
  
      private fun loadCurrentSourceNow(playWhenReady: Boolean) {
          val sourceUrl = currentSourceUrl ?: return
@@ -324,7 +347,7 @@ index 9ec8dd1..8f482be 100644
          applyRequestHeadersNow(currentRequestHeaders)
          setPausedNow(!playWhenReady)
          mpv.setPropertyString("aid", "auto")
-@@ -1656,6 +1658,22 @@ private class NuvioLibmpvView(
+@@ -1657,6 +1668,22 @@ private class NuvioLibmpvView(
          setPausedNow(!playWhenReady)
      }
  
@@ -348,10 +371,10 @@ index 9ec8dd1..8f482be 100644
          executeMpv {
              currentExternalSubtitles.forEachIndexed { index, subtitle ->
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlatformEffects.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlatformEffects.android.kt
-index e0cadb8..0d487b0 100644
+index e0cadb85..69c10708 100644
 --- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlatformEffects.android.kt
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlatformEffects.android.kt
-@@ -64,6 +64,25 @@ actual fun HidePlayerSystemBars() {
+@@ -64,14 +64,56 @@ actual fun HidePlayerSystemBars() {
      DisposableEffect(window) {
          val controller = WindowCompat.getInsetsController(window, window.decorView)
          val previousBehavior = controller.systemBarsBehavior
@@ -377,8 +400,26 @@ index e0cadb8..0d487b0 100644
  
          controller.hide(WindowInsetsCompat.Type.systemBars())
          controller.systemBarsBehavior =
-@@ -72,6 +91,12 @@ actual fun HidePlayerSystemBars() {
+             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+ 
++        // MIUI can keep the launcher wallpaper composited behind a freshly
++        // launched window, which leaves the SurfaceView letterbox strips
++        // translucent until the window state is rebuilt (entering and leaving
++        // a floating window cures it). Re-issue the bar hide and the insets
++        // dispatch shortly after the player opens so the same state heals
++        // itself without any user action.
++        val healKick = Runnable {
++            val kickController = WindowCompat.getInsetsController(window, window.decorView)
++            kickController.hide(WindowInsetsCompat.Type.systemBars())
++            kickController.systemBarsBehavior =
++                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
++            window.decorView.requestApplyInsets()
++        }
++        window.decorView.postDelayed(healKick, 450L)
++        window.decorView.postDelayed(healKick, 1500L)
++
          onDispose {
++            window.decorView.removeCallbacks(healKick)
              controller.show(WindowInsetsCompat.Type.systemBars())
              controller.systemBarsBehavior = previousBehavior
 +            window.decorView.background = previousDecorBackground
@@ -391,7 +432,7 @@ index e0cadb8..0d487b0 100644
      }
  }
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
-index 0323307..be87796 100644
+index 03233077..be877963 100644
 --- a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/player/PlayerPlaybackNetworking.kt
 @@ -5,7 +5,7 @@ import androidx.media3.datasource.DataSource
@@ -417,7 +458,7 @@ index 0323307..be87796 100644
              .connectTimeout(15, TimeUnit.SECONDS)
 diff --git a/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt
 new file mode 100644
-index 0000000..08f6f35
+index 00000000..08f6f355
 --- /dev/null
 +++ b/composeApp/src/androidMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.android.kt
 @@ -0,0 +1,26 @@
@@ -448,7 +489,7 @@ index 0000000..08f6f35
 +    }
 +}
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/MainTabsDestination.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/MainTabsDestination.kt
-index 1032903..4ed3ff5 100644
+index 10329036..4ed3ff58 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/MainTabsDestination.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/MainTabsDestination.kt
 @@ -31,6 +31,7 @@ import com.nuvio.app.core.ui.FloatingNavigationBar
@@ -506,9 +547,7 @@ index 1032903..4ed3ff5 100644
                          items = floatingNavigationItems,
                          glowEnabled = navBarGlowEnabled,
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
-old mode 100644
-new mode 100755
-index 3747d1e..57f80f5
+index 3747d1ef..57f80f51 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerEpisodesPanel.kt
 @@ -46,6 +46,7 @@ import com.nuvio.app.core.ui.NuvioTokens
@@ -537,7 +576,7 @@ index 3747d1e..57f80f5
  
          PlayerStreamList(
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerScreenRuntimeUi.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerScreenRuntimeUi.kt
-index 59e92f2..3ca7b66 100644
+index 59e92f2e..3ca7b66b 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerScreenRuntimeUi.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerScreenRuntimeUi.kt
 @@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
@@ -571,9 +610,7 @@ index 59e92f2..3ca7b66 100644
              .playerSurfaceTapGestures(
                  layoutSize = layoutSize,
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
-old mode 100644
-new mode 100755
-index f547f21..cc2c170
+index f547f21a..cc2c1701 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerSourcesPanel.kt
 @@ -13,6 +13,7 @@ import androidx.compose.ui.text.style.TextOverflow
@@ -602,9 +639,7 @@ index f547f21..cc2c170
  
              PlayerStreamList(
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
-old mode 100644
-new mode 100755
-index 55a3dae..bd0462f
+index 55a3dae1..bd0462fb 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerStreamsRepository.kt
 @@ -20,6 +20,8 @@ import com.nuvio.app.features.streams.InstalledStreamAddonTarget
@@ -686,9 +721,7 @@ index 55a3dae..bd0462f
          PluginRepository.setLocalPluginSearchPaused(true)
          episodeStreamsJob?.cancel()
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
-old mode 100644
-new mode 100755
-index 28bee25..c4cf7fe
+index 28bee257..c4cf7fe4 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamModels.kt
 @@ -134,6 +134,32 @@ data class StreamItem(
@@ -759,7 +792,7 @@ index 28bee25..c4cf7fe
          get() = filteredGroups.flatMap { it.streams }
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt
 new file mode 100644
-index 0000000..f813ea2
+index 00000000..f813ea2e
 --- /dev/null
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.kt
 @@ -0,0 +1,6 @@
@@ -771,7 +804,7 @@ index 0000000..f813ea2
 +}
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt
 new file mode 100644
-index 0000000..3196139
+index 00000000..3196139e
 --- /dev/null
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilters.kt
 @@ -0,0 +1,497 @@
@@ -1273,9 +1306,7 @@ index 0000000..3196139
 +    }
 +}
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
-old mode 100644
-new mode 100755
-index 58fd52c..08073fd
+index 58fd52c0..08073fde 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsRepository.kt
 @@ -33,7 +33,10 @@ import kotlinx.coroutines.launch
@@ -1320,9 +1351,7 @@ index 58fd52c..08073fd
          activeRequestKey = null
          _uiState.update {
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
-old mode 100644
-new mode 100755
-index c003a58..56ec937
+index c003a587..56ec9377 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsScreen.kt
 @@ -497,6 +497,16 @@ private fun MobileStreamsLayout(
@@ -1351,9 +1380,7 @@ index c003a58..56ec937
      val fetchingText = stringResource(Res.string.streams_fetching)
      val findingStreamsText = stringResource(Res.string.streams_finding_streams)
 diff --git a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
-old mode 100644
-new mode 100755
-index 956cdbf..465b456
+index 956cdbfb..465b4566 100644
 --- a/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
 +++ b/composeApp/src/commonMain/kotlin/com/nuvio/app/features/streams/StreamsTabletLayout.kt
 @@ -210,6 +210,16 @@ internal fun TabletStreamsLayout(
@@ -1375,7 +1402,7 @@ index 956cdbf..465b456
                              modifier = Modifier.padding(bottom = 4.dp),
 diff --git a/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt
 new file mode 100644
-index 0000000..1f28f57
+index 00000000..1f28f57b
 --- /dev/null
 +++ b/composeApp/src/iosMain/kotlin/com/nuvio/app/features/streams/StreamSourceFilterStorage.ios.kt
 @@ -0,0 +1,15 @@
